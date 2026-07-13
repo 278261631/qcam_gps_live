@@ -29,7 +29,7 @@ class QHYCamApp:
         self._captured_image = None
         self._photo = None
         self._camera_list = []
-        self._current_read_mode = 0
+        self._current_read_mode = 1
 
         self._build_ui()
         self._refresh_sdk_status()
@@ -101,17 +101,6 @@ class QHYCamApp:
         ttk.Label(camf, textvariable=self._cam_model_var).pack(anchor=tk.W, pady=(4, 0))
         self._cam_color_var = tk.StringVar(value="")
         ttk.Label(camf, textvariable=self._cam_color_var).pack(anchor=tk.W)
-
-        # --- Read Mode ---
-        rdf = ttk.LabelFrame(frame, text="Read Mode", padding=6)
-        rdf.pack(fill=tk.X, pady=4)
-        rmf = ttk.Frame(rdf)
-        rmf.pack(fill=tk.X)
-        self._read_mode_combo = ttk.Combobox(rmf, state="readonly", width=30)
-        self._read_mode_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._read_mode_combo.bind("<<ComboboxSelected>>", self._on_read_mode_select)
-        self._read_mode_info_var = tk.StringVar(value="")
-        ttk.Label(rdf, textvariable=self._read_mode_info_var, foreground="#555").pack(anchor=tk.W, pady=(2, 0))
 
         # --- Parameters ---
         paramf = ttk.LabelFrame(frame, text="Parameters", padding=6)
@@ -267,8 +256,9 @@ class QHYCamApp:
 
         Sequence matching cmake demos:
           InitQHYCCDResource -> EnableQHYCCDMessage -> Scan ->
-          Open -> SetReadMode -> SetBitsMode -> SetStreamMode ->
-          InitQHYCCD -> [chip/params/resolution] -> ready
+          Open -> SetReadMode -> SetStreamMode(LIVE_MODE) ->
+          InitQHYCCD -> SetBitsMode -> ChipInfo -> SetResolution ->
+          GetMemLength -> SetExposure -> ready
         """
         if not self._check_sdk():
             self._log("SDK not available, connect a QHYCCD camera.")
@@ -323,25 +313,23 @@ class QHYCamApp:
             extra.append("GPS")
         self._cam_color_var.set(f"{color_str}  {' | '.join(extra)}")
 
-        # Populate read modes
-        self._populate_read_modes()
-
-        # 4. Set read mode, bits mode, stream mode (before InitQHYCCD per demos)
+        # 4. SetReadMode(1) -> SetStreamMode(LIVE_MODE) -> InitQHYCCD
         self.sdk.set_read_mode(self._current_read_mode)
         self._log(f"SetQHYCCDReadMode({self._current_read_mode})")
-        self.sdk.set_bits_mode(int(self._bits_combo.get()))
-        self._log(f"SetQHYCCDBitsMode({self._bits_combo.get()})")
-        self.sdk.set_stream_mode(SINGLE_MODE)
-        self._log("SetQHYCCDStreamMode(SINGLE_MODE)")
+        self.sdk.set_stream_mode(LIVE_MODE)
+        self._log("SetQHYCCDStreamMode(LIVE_MODE)")
 
-        # 5. InitQHYCCD
         ret = self.sdk.init()
         if ret != QHYCCDError.QHYCCD_SUCCESS:
             self._log(f"ERROR: InitQHYCCD: {error_string(ret)}")
             return
         self._log("InitQHYCCD: OK")
 
-        # 6. Chip info
+        # 5. SetBitsMode after InitQHYCCD (per demo)
+        self.sdk.set_bits_mode(int(self._bits_combo.get()))
+        self._log(f"SetQHYCCDBitsMode({self._bits_combo.get()})")
+
+        # 6. Chip info + Resolution + MemLength (per demo order)
         chip = self.sdk.get_chip_info()
         if chip:
             cw, ch, iw, ih, pw, ph, bpp = chip
@@ -349,61 +337,27 @@ class QHYCamApp:
 
         area = self.sdk.get_effective_area()
         if area and area[2] > 0:
-            self._log(f"Effective: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
+            self._full_w, self._full_h = area[2], area[3]
             self._res_x_var.set(str(area[0]))
             self._res_y_var.set(str(area[1]))
             self._res_w_var.set(str(area[2]))
             self._res_h_var.set(str(area[3]))
-
-        oscan = self.sdk.get_overscan_area()
-        if oscan:
-            self._log(f"Overscan: ({oscan[0]},{oscan[1]}) {oscan[2]}x{oscan[3]}")
-
-        # 7. Default params
-        self.sdk.set_param(ControlID.CONTROL_USBTRAFFIC, 30.0)
-        self.sdk.set_param(ControlID.CONTROL_GAIN, 10.0)
-        self.sdk.set_param(ControlID.CONTROL_OFFSET, 140.0)
-        self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
-        self.sdk.set_param(ControlID.CONTROL_DDR, 1.0)
-        self.sdk.set_debayer_onoff(False)
-
-        if area and area[2] > 0:
             self.sdk.set_resolution(area[0], area[1], area[2], area[3])
+            self._log(f"SetQHYCCDResolution: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
+        else:
+            self._full_w = self._full_h = 0
+
+        self._mem_len = self.sdk.get_mem_length()
+        self._log(f"GetQHYCCDMemLength: {self._mem_len} bytes")
+
+        # 7. Default exposure
+        self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
 
         self._btn_single.configure(state=tk.NORMAL)
         self._btn_live.configure(state=tk.NORMAL)
         self._btn_close.configure(state=tk.NORMAL)
         self._enable_params(True)
         self._log("=== Ready ===")
-
-    def _populate_read_modes(self):
-        num = self.sdk.get_number_of_read_modes()
-        if num <= 0:
-            self._read_mode_combo["values"] = ["Default"]
-            self._read_mode_combo.set("Default")
-            return
-
-        modes = []
-        for i in range(num):
-            name = self.sdk.get_read_mode_name(i) or f"Mode {i}"
-            res = self.sdk.get_read_mode_resolution(i)
-            if res:
-                modes.append(f"[{i}] {name} ({res[0]}x{res[1]})")
-            else:
-                modes.append(f"[{i}] {name}")
-        self._read_mode_combo["values"] = modes
-        self._read_mode_combo.current(0)
-        self._on_read_mode_select()
-
-    def _on_read_mode_select(self, event=None):
-        sel = self._read_mode_combo.current()
-        if sel >= 0:
-            self._current_read_mode = sel
-            res = self.sdk.get_read_mode_resolution(sel)
-            if res:
-                self._read_mode_info_var.set(f"Base resolution: {res[0]} x {res[1]}")
-            else:
-                self._read_mode_info_var.set("")
 
     def _close_camera(self):
         if self._live_running:
@@ -415,9 +369,6 @@ class QHYCamApp:
 
         self._cam_model_var.set("Model: --")
         self._cam_color_var.set("")
-        self._read_mode_combo["values"] = []
-        self._read_mode_combo.set("")
-        self._read_mode_info_var.set("")
         self._btn_close.configure(state=tk.DISABLED)
         self._btn_single.configure(state=tk.DISABLED)
         self._btn_live.configure(state=tk.DISABLED)
@@ -544,31 +495,48 @@ class QHYCamApp:
     # Single frame capture
     # ==============================================================
     def _capture_single(self):
-        if not self._check_sdk() or not self.sdk.handle:
+        if not self.sdk.handle:
             return
 
-        self._log("Starting single frame exposure...")
+        self._log("Single frame: switching to SINGLE_MODE...")
+
+        # Re-init with SINGLE_MODE for single frame (stream mode locked at init)
         self.sdk.set_stream_mode(SINGLE_MODE)
+        ret = self.sdk.init()
+        if ret != QHYCCDError.QHYCCD_SUCCESS:
+            self._log(f"ERROR re-init: {error_string(ret)}")
+            return
+
         ret = self.sdk.exp_single_frame()
         if ret == QHYCCDError.QHYCCD_READ_DIRECTLY:
-            self._log("Camera needs READ_DIRECTLY mode, reading immediately...")
-            self._read_single_frame()
+            self._log("READ_DIRECTLY mode, reading...")
+            self._read_single_frame(after_switch_back=True)
         elif ret == QHYCCDError.QHYCCD_SUCCESS:
-            self._log("Exposure started, waiting before read...")
-            self.root.after(100, self._read_single_frame)
+            self._log("Exposure started, waiting...")
+            self.root.after(100, lambda: self._read_single_frame(after_switch_back=True))
         else:
             self._log(f"ERROR exposure: {error_string(ret)}")
+            self._restore_live_mode()
 
-    def _read_single_frame(self):
+    def _read_single_frame(self, after_switch_back=False):
         result = self.sdk.get_single_frame()
         if result is None:
-            self._log("WARNING: No frame data (still exposing?)")
-            self.root.after(500, self._read_single_frame)
+            self._log("Waiting for frame...")
+            self.root.after(300, lambda: self._read_single_frame(after_switch_back))
             return
         w, h, bpp, ch, imgdata = result
         self._log(f"Frame: {w}x{h}, {bpp}bit, {ch}ch, {len(imgdata)} bytes")
         self._display_image(w, h, bpp, ch, imgdata)
         self._btn_save.configure(state=tk.NORMAL)
+
+        if after_switch_back:
+            self._restore_live_mode()
+
+    def _restore_live_mode(self):
+        self._log("Restoring LIVE_MODE...")
+        self.sdk.set_stream_mode(LIVE_MODE)
+        self.sdk.init()
+        self._log("LIVE_MODE restored.")
 
     # ==============================================================
     # Live capture
@@ -580,10 +548,10 @@ class QHYCamApp:
             self._start_live()
 
     def _start_live(self):
-        if not self._check_sdk() or not self.sdk.handle:
+        if not self.sdk.handle:
             return
         self._log("Starting live video...")
-        self.sdk.set_stream_mode(LIVE_MODE)
+        self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
         ret = self.sdk.begin_live()
         if ret != QHYCCDError.QHYCCD_SUCCESS:
             self._log(f"ERROR begin live: {error_string(ret)}")
