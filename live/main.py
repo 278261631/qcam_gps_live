@@ -281,13 +281,22 @@ class QHYCamApp:
         self._sdk_status_var.set("SDK: Loading...")
         self.root.update()
         self.sdk = QHYCCDSDK()
-        self.sdk._ensure_lib()
+        try:
+            self.sdk.init_resource()
+        except RuntimeError as e:
+            self._log(f"ERROR: Cannot load SDK: {e}")
+            self._sdk_status_var.set("SDK: Load Failed")
+            return
         self._refresh_sdk_status()
-        self._log("SDK reloaded.")
-        if self.sdk.lib:
-            self._log("Tip: click 'Auto Init' for one-click setup.")
+        self._log("SDK initialized.")
 
     def _check_sdk(self):
+        if not self.sdk.initialized and not self.sdk.lib:
+            try:
+                self.sdk.init_resource()
+                self._refresh_sdk_status()
+            except RuntimeError as e:
+                self._log(f"SDK init failed: {e}")
         if not self.sdk.lib:
             messagebox.showwarning("SDK Not Available",
                                     "The QHYCCD SDK library is not loaded.\n"

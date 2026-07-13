@@ -249,16 +249,8 @@ class QHYCCDSDK:
         self._initialized = False
         self._handle = None
 
-    def load(self):
-        """Convenience: ensure SDK library is loaded. Returns True on success."""
-        try:
-            self._ensure_lib()
-            return True
-        except RuntimeError:
-            return False
-
     # ----------------------------------------------------------------
-    # Library loading
+    # Library loading (internal)
     # ----------------------------------------------------------------
     def _ensure_lib(self):
         if self._lib is None:
@@ -274,7 +266,7 @@ class QHYCCDSDK:
         lib.InitQHYCCDResource.restype = c_uint32
         lib.ReleaseQHYCCDResource.restype = c_uint32
         lib.EnableQHYCCDMessage.argtypes = [c_bool]
-        lib.EnableQHYCCDMessage.restype = c_uint32
+        lib.EnableQHYCCDMessage.restype = None  # void in C header
 
         # --- Scanning ---
         lib.ScanQHYCCD.restype = c_uint32
@@ -449,7 +441,7 @@ class QHYCCDSDK:
 
     def get_camera_id(self, index):
         self._ensure_lib()
-        buf = create_string_buffer(64)
+        buf = create_string_buffer(256)
         ret = self._lib.GetQHYCCDId(c_uint32(index), buf)
         if ret == QHYCCDError.QHYCCD_SUCCESS:
             return buf.value.decode("utf-8", errors="replace")
@@ -458,7 +450,7 @@ class QHYCCDSDK:
     def get_camera_model(self, camera_id):
         self._ensure_lib()
         cid = camera_id.encode("utf-8") if isinstance(camera_id, str) else camera_id
-        buf = create_string_buffer(64)
+        buf = create_string_buffer(128)
         ret = self._lib.GetQHYCCDModel(c_char_p(cid), buf)
         if ret == QHYCCDError.QHYCCD_SUCCESS:
             return buf.value.decode("utf-8", errors="replace")
