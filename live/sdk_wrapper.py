@@ -668,7 +668,8 @@ class QHYCCDSDK:
             cast(imgdata, POINTER(c_uint8))
         )
         if ret == QHYCCDError.QHYCCD_SUCCESS:
-            return (w.value, h_val.value, bpp.value, channels.value, bytes(imgdata))
+            actual = w.value * h_val.value * (bpp.value // 8) * channels.value
+            return (w.value, h_val.value, bpp.value, channels.value, bytes(imgdata[:actual]))
         return None
 
     def cancel_exposing(self, handle=None):
@@ -709,7 +710,8 @@ class QHYCCDSDK:
             cast(imgdata, POINTER(c_uint8))
         )
         if ret == QHYCCDError.QHYCCD_SUCCESS:
-            return (w.value, h_val.value, bpp.value, channels.value, bytes(imgdata))
+            actual = w.value * h_val.value * (bpp.value // 8) * channels.value
+            return (w.value, h_val.value, bpp.value, channels.value, bytes(imgdata[:actual]))
         return None
 
     def stop_live(self, handle=None):
