@@ -3,7 +3,7 @@ import sys
 import time
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, filedialog
 from PIL import Image, ImageTk
 import numpy as np
 
@@ -33,6 +33,7 @@ class QHYCamApp:
 
         self._build_ui()
         self._refresh_sdk_status()
+        self.root.after(200, self._auto_init)
 
     # ==============================================================
     # UI Construction
@@ -78,23 +79,13 @@ class QHYCamApp:
         ttk.Label(sdkf, textvariable=self._sdk_ver_var, foreground="#555").pack(anchor=tk.W)
         self._platform_var = tk.StringVar(value="")
         ttk.Label(sdkf, textvariable=self._platform_var, foreground="#555").pack(anchor=tk.W)
-        ttk.Button(sdkf, text="Reload SDK", command=self._reload_sdk).pack(anchor=tk.W, pady=(2, 0))
 
         # --- Camera Scan ---
-        scanf = ttk.LabelFrame(frame, text="Camera Scan", padding=6)
+        scanf = ttk.LabelFrame(frame, text="Camera", padding=6)
         scanf.pack(fill=tk.X, pady=4)
 
-        btnf = ttk.Frame(scanf)
-        btnf.pack(fill=tk.X)
-        ttk.Button(btnf, text="Scan Cameras", command=self._scan_cameras).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(btnf, text="Refresh List", command=self._scan_cameras).pack(side=tk.LEFT)
-        self._btn_auto_scan = ttk.Button(btnf, text="Auto Init (Scan + Open + Init)",
-                                          command=self._auto_init, state=tk.DISABLED)
-        self._btn_auto_scan.pack(side=tk.RIGHT)
-
-        self._cam_listbox = tk.Listbox(scanf, height=6, exportselection=False)
-        self._cam_listbox.pack(fill=tk.X, pady=(4, 0))
-        self._cam_listbox.bind("<<ListboxSelect>>", self._on_camera_select)
+        self._cam_listbox = tk.Listbox(scanf, height=4, exportselection=False)
+        self._cam_listbox.pack(fill=tk.X, pady=(0, 0))
 
         # --- Camera Operations ---
         camf = ttk.LabelFrame(frame, text="Camera Control", padding=6)
@@ -102,19 +93,9 @@ class QHYCamApp:
 
         self._cam_btn_frame = ttk.Frame(camf)
         self._cam_btn_frame.pack(fill=tk.X)
-        self._btn_open = ttk.Button(self._cam_btn_frame, text="Open Camera",
-                                     command=self._open_camera, state=tk.DISABLED)
-        self._btn_open.pack(side=tk.LEFT, padx=(0, 4))
         self._btn_close = ttk.Button(self._cam_btn_frame, text="Close Camera",
                                       command=self._close_camera, state=tk.DISABLED)
         self._btn_close.pack(side=tk.LEFT)
-        self._btn_init = ttk.Button(self._cam_btn_frame, text="Init Camera",
-                                     command=self._init_camera, state=tk.DISABLED)
-        self._btn_init.pack(side=tk.LEFT, padx=(4, 0))
-
-        self._btn_auto = ttk.Button(self._cam_btn_frame, text="Auto Init",
-                                     command=self._auto_init, state=tk.DISABLED)
-        self._btn_auto.pack(side=tk.LEFT, padx=(4, 0))
 
         self._cam_model_var = tk.StringVar(value="Model: --")
         ttk.Label(camf, textvariable=self._cam_model_var).pack(anchor=tk.W, pady=(4, 0))
@@ -268,75 +249,49 @@ class QHYCamApp:
     def _refresh_sdk_status(self):
         pinfo = platform_info()
         self._platform_var.set(f"Platform: {pinfo['system']}  |  Library: {pinfo['lib_name']}")
-        if pinfo["loaded"]:
-            self._sdk_status_var.set("SDK: Loaded")
-            ver = self.sdk.get_sdk_version_string()
-            self._sdk_ver_var.set(f"SDK Version: {ver}")
-            self._btn_auto_scan.configure(state=tk.NORMAL)
-        else:
-            self._sdk_status_var.set("SDK: Not Loaded (camera hardware/device not present)")
-            self._sdk_ver_var.set("Connect a QHYCCD camera to load the SDK.")
-
-    def _reload_sdk(self):
-        self._sdk_status_var.set("SDK: Loading...")
-        self.root.update()
-        self.sdk = QHYCCDSDK()
-        try:
-            self.sdk.init_resource()
-        except RuntimeError as e:
-            self._log(f"ERROR: Cannot load SDK: {e}")
-            self._sdk_status_var.set("SDK: Load Failed")
-            return
-        self._refresh_sdk_status()
-        self._log("SDK initialized.")
+        self._sdk_status_var.set("SDK: Ready")
+        ver = self.sdk.get_sdk_version_string()
+        self._sdk_ver_var.set(f"SDK Version: {ver}")
 
     def _check_sdk(self):
-        if not self.sdk.initialized and not self.sdk.lib:
+        if not self.sdk.lib:
             try:
                 self.sdk.init_resource()
-                self._refresh_sdk_status()
             except RuntimeError as e:
                 self._log(f"SDK init failed: {e}")
-        if not self.sdk.lib:
-            messagebox.showwarning("SDK Not Available",
-                                    "The QHYCCD SDK library is not loaded.\n"
-                                    "This typically means no QHYCCD camera is connected,\n"
-                                    "or the driver/sdk files are not installed.")
-            return False
+                return False
         return True
 
     def _auto_init(self):
-        """One-click auto initialization: scan, open first camera, init.
+        """Auto init on startup: scan, open first camera, set readmode/bits.
 
-        Full sequence matching SDK demos:
-          InitQHYCCDResource -> ScanQHYCCD -> GetQHYCCDId(0) ->
-          OpenQHYCCD -> SetQHYCCDReadMode(0) -> SetQHYCCDStreamMode ->
-          InitQHYCCD -> [chip info/params/resolution] -> ready
+        Sequence matching cmake demos:
+          InitQHYCCDResource -> EnableQHYCCDMessage -> Scan ->
+          Open -> SetReadMode -> SetBitsMode -> SetStreamMode ->
+          InitQHYCCD -> [chip/params/resolution] -> ready
         """
         if not self._check_sdk():
+            self._log("SDK not available, connect a QHYCCD camera.")
             return
 
-        self._log("=== Auto Init started ===")
+        self._log("=== Auto Init ===")
 
         # 1. Init SDK resource
         ret = self.sdk.init_resource()
         if ret != QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"ERROR: InitQHYCCDResource failed: {error_string(ret)}")
-            messagebox.showerror("Auto Init", f"InitQHYCCDResource failed: {error_string(ret)}")
+            self._log(f"ERROR: InitQHYCCDResource: {error_string(ret)}")
             return
         self._log("InitQHYCCDResource: OK")
         self.sdk.enable_message(True)
 
-        # 2. Scan cameras
+        # 2. Scan
         count = self.sdk.scan()
-        self._log(f"ScanQHYCCD: found {count} camera(s)")
+        self._log(f"ScanQHYCCD: {count} camera(s)")
         if count == 0:
-            self._log("ERROR: No camera found.")
-            messagebox.showwarning("Auto Init", "No QHYCCD camera found.\nPlease check USB connection and power.")
+            self._log("No camera found.")
             self.sdk.release_resource()
             return
 
-        # 3. Refresh list box
         self._camera_list.clear()
         self._cam_listbox.delete(0, tk.END)
         for i in range(count):
@@ -344,21 +299,19 @@ class QHYCamApp:
             model = self.sdk.get_camera_model(cid) if cid else "Unknown"
             self._cam_listbox.insert(tk.END, f"[{i}] {model} ({cid})")
             self._camera_list.append(cid)
-        self._cam_listbox.selection_set(0)
 
-        # 4. Open first camera
+        # 3. Open first camera
         cid = self._camera_list[0]
         self._log(f"OpenQHYCCD({cid})...")
         handle = self.sdk.open(cid)
         if not handle:
             self._log("ERROR: OpenQHYCCD failed.")
-            messagebox.showerror("Auto Init", "Failed to open camera.")
             self.sdk.release_resource()
             return
 
         model = self.sdk.get_camera_model(cid)
         fw = self.sdk.get_fw_version()
-        self._cam_model_var.set(f"Model: {model}  FW: {fw}  ({cid})")
+        self._cam_model_var.set(f"Model: {model}  FW: {fw}")
         self._log(f"Camera opened: {model}, FW: {fw}")
 
         bayer = self.sdk.get_color_bayer()
@@ -370,108 +323,58 @@ class QHYCamApp:
             extra.append("GPS")
         self._cam_color_var.set(f"{color_str}  {' | '.join(extra)}")
 
-        # 5. Populate read modes
-        self._populate_read_modes()
-
-        # 6. Init the camera (full sequence)
-        self._init_camera()
-
-        # Enable buttons
-        self._btn_open.configure(state=tk.DISABLED)
-        self._btn_close.configure(state=tk.NORMAL)
-
-        self._log("=== Auto Init complete ===")
-
-    # ==============================================================
-    # Camera Discovery
-    # ==============================================================
-    def _scan_cameras(self):
-        if not self._check_sdk():
-            self._log("Cannot scan: SDK not loaded.")
-            return
-
-        self._log("Scanning for cameras...")
-        count = self.sdk.scan()
-        self._log(f"Found {count} camera(s).")
-
-        self._camera_list.clear()
-        self._cam_listbox.delete(0, tk.END)
-
-        for i in range(count):
-            cid = self.sdk.get_camera_id(i)
-            model = self.sdk.get_camera_model(cid) if cid else "Unknown"
-            entry = f"[{i}] {model} ({cid})"
-            self._cam_listbox.insert(tk.END, entry)
-            self._camera_list.append(cid)
-
-        if count == 0:
-            self._cam_listbox.insert(tk.END, "(No cameras found)")
-
-    # ==============================================================
-    # Camera Open / Init (matches SDK demo sequence)
-    #
-    # Demos sequence:
-    #   InitQHYCCDResource() -> ScanQHYCCD() -> GetQHYCCDId() ->
-    #   OpenQHYCCD() -> [FW version] -> [check mode support] ->
-    #   SetQHYCCDReadMode() -> SetQHYCCDStreamMode() ->
-    #   InitQHYCCD() -> [chip info / params / resolution] -> capture
-    # ==============================================================
-    def _on_camera_select(self, event):
-        sel = self._cam_listbox.curselection()
-        if sel:
-            self._btn_open.configure(state=tk.NORMAL)
-        else:
-            self._btn_open.configure(state=tk.DISABLED)
-
-    def _get_selected_camera_id(self):
-        sel = self._cam_listbox.curselection()
-        if not sel:
-            messagebox.showwarning("No Camera", "Please select a camera from the list.")
-            return None
-        idx = sel[0]
-        if idx >= len(self._camera_list):
-            return None
-        return self._camera_list[idx]
-
-    def _open_camera(self):
-        cid = self._get_selected_camera_id()
-        if not cid or not self._check_sdk():
-            return
-
-        self._log(f"Opening camera: {cid}")
-        handle = self.sdk.open(cid)
-        if not handle:
-            self._log("ERROR: Failed to open camera.")
-            messagebox.showerror("Error", "Failed to open camera.")
-            return
-
-        model = self.sdk.get_camera_model(cid)
-        fw = self.sdk.get_fw_version()
-        self._cam_model_var.set(f"Model: {model}  FW: {fw}  ({cid})")
-        self._log(f"Camera opened: {model}, FW: {fw}")
-
-        # Detect color / Bayer pattern
-        bayer = self.sdk.get_color_bayer()
-        if bayer:
-            color_str = f"Color ({bayer.name})"
-        else:
-            color_str = "Mono"
-
-        has_cool = self.sdk.has_cooler()
-        has_gps = self.sdk.has_gps()
-        extra = []
-        if has_cool:
-            extra.append("Cooler")
-        if has_gps:
-            extra.append("GPS")
-        self._cam_color_var.set(f"{color_str}  {' | '.join(extra)}")
-
         # Populate read modes
         self._populate_read_modes()
 
-        self._btn_init.configure(state=tk.NORMAL)
+        # 4. Set read mode, bits mode, stream mode (before InitQHYCCD per demos)
+        self.sdk.set_read_mode(self._current_read_mode)
+        self._log(f"SetQHYCCDReadMode({self._current_read_mode})")
+        self.sdk.set_bits_mode(int(self._bits_combo.get()))
+        self._log(f"SetQHYCCDBitsMode({self._bits_combo.get()})")
+        self.sdk.set_stream_mode(SINGLE_MODE)
+        self._log("SetQHYCCDStreamMode(SINGLE_MODE)")
+
+        # 5. InitQHYCCD
+        ret = self.sdk.init()
+        if ret != QHYCCDError.QHYCCD_SUCCESS:
+            self._log(f"ERROR: InitQHYCCD: {error_string(ret)}")
+            return
+        self._log("InitQHYCCD: OK")
+
+        # 6. Chip info
+        chip = self.sdk.get_chip_info()
+        if chip:
+            cw, ch, iw, ih, pw, ph, bpp = chip
+            self._log(f"Chip: {cw:.1f}x{ch:.1f}mm, Max: {iw}x{ih}, Pixel: {pw:.1f}x{ph:.1f}um, {bpp}bit")
+
+        area = self.sdk.get_effective_area()
+        if area and area[2] > 0:
+            self._log(f"Effective: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
+            self._res_x_var.set(str(area[0]))
+            self._res_y_var.set(str(area[1]))
+            self._res_w_var.set(str(area[2]))
+            self._res_h_var.set(str(area[3]))
+
+        oscan = self.sdk.get_overscan_area()
+        if oscan:
+            self._log(f"Overscan: ({oscan[0]},{oscan[1]}) {oscan[2]}x{oscan[3]}")
+
+        # 7. Default params
+        self.sdk.set_param(ControlID.CONTROL_USBTRAFFIC, 30.0)
+        self.sdk.set_param(ControlID.CONTROL_GAIN, 10.0)
+        self.sdk.set_param(ControlID.CONTROL_OFFSET, 140.0)
+        self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
+        self.sdk.set_param(ControlID.CONTROL_DDR, 1.0)
+        self.sdk.set_debayer_onoff(False)
+
+        if area and area[2] > 0:
+            self.sdk.set_resolution(area[0], area[1], area[2], area[3])
+
+        self._btn_single.configure(state=tk.NORMAL)
+        self._btn_live.configure(state=tk.NORMAL)
         self._btn_close.configure(state=tk.NORMAL)
-        self._btn_open.configure(state=tk.DISABLED)
+        self._enable_params(True)
+        self._log("=== Ready ===")
 
     def _populate_read_modes(self):
         num = self.sdk.get_number_of_read_modes()
@@ -502,67 +405,6 @@ class QHYCamApp:
             else:
                 self._read_mode_info_var.set("")
 
-    def _init_camera(self):
-        if not self._check_sdk():
-            return
-
-        # 1. Set read mode (must come before stream mode, per demos)
-        self._log(f"SetQHYCCDReadMode({self._current_read_mode})...")
-        ret = self.sdk.set_read_mode(self._current_read_mode)
-        if ret != QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"WARNING: SetQHYCCDReadMode: {error_string(ret)}")
-
-        # 2. Set stream mode (also before InitQHYCCD, per demos)
-        self._log("SetQHYCCDStreamMode(SINGLE_MODE)...")
-        ret = self.sdk.set_stream_mode(SINGLE_MODE)
-        if ret != QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"WARNING: SetQHYCCDStreamMode: {error_string(ret)}")
-
-        # 3. Init camera
-        self._log("InitQHYCCD...")
-        ret = self.sdk.init()
-        if ret != QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"ERROR: Init failed: {error_string(ret)}")
-            messagebox.showerror("Error", f"Camera init failed: {error_string(ret)}")
-            return
-        self._log("Camera initialized successfully.")
-
-        # 4. Get chip info
-        chip = self.sdk.get_chip_info()
-        if chip:
-            cw, ch, iw, ih, pw, ph, bpp = chip
-            self._log(f"Chip: {cw:.1f}x{ch:.1f}mm, Max: {iw}x{ih}, Pixel: {pw:.1f}x{ph:.1f}um, {bpp}bit")
-
-        # 5. Get effective / overscan areas
-        area = self.sdk.get_effective_area()
-        if area and area[2] > 0 and area[3] > 0:
-            self._log(f"Effective area: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
-            self._res_x_var.set(str(area[0]))
-            self._res_y_var.set(str(area[1]))
-            self._res_w_var.set(str(area[2]))
-            self._res_h_var.set(str(area[3]))
-
-        oscan = self.sdk.get_overscan_area()
-        if oscan:
-            self._log(f"Overscan area: ({oscan[0]},{oscan[1]}) {oscan[2]}x{oscan[3]}")
-
-        # 6. Set default params (matching demos)
-        self.sdk.set_param(ControlID.CONTROL_USBTRAFFIC, 30.0)
-        self.sdk.set_param(ControlID.CONTROL_GAIN, 10.0)
-        self.sdk.set_param(ControlID.CONTROL_OFFSET, 140.0)
-        self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
-        self.sdk.set_param(ControlID.CONTROL_DDR, 1.0)
-        self.sdk.set_bits_mode(8)
-        self.sdk.set_debayer_onoff(False)
-
-        # Set default resolution
-        if area and area[2] > 0:
-            self.sdk.set_resolution(area[0], area[1], area[2], area[3])
-
-        self._btn_single.configure(state=tk.NORMAL)
-        self._btn_live.configure(state=tk.NORMAL)
-        self._enable_params(True)
-
     def _close_camera(self):
         if self._live_running:
             self._stop_live()
@@ -577,12 +419,10 @@ class QHYCamApp:
         self._read_mode_combo.set("")
         self._read_mode_info_var.set("")
         self._btn_close.configure(state=tk.DISABLED)
-        self._btn_init.configure(state=tk.DISABLED)
         self._btn_single.configure(state=tk.DISABLED)
         self._btn_live.configure(state=tk.DISABLED)
         self._btn_save.configure(state=tk.DISABLED)
         self._enable_params(False)
-        self._btn_open.configure(state=tk.NORMAL)
 
     def _enable_params(self, enabled):
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -841,12 +681,9 @@ class QHYCamApp:
 
 
 def main():
-    auto_init = "--auto" in sys.argv
     root = tk.Tk()
     app = QHYCamApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
-    if auto_init:
-        root.after(500, app._auto_init)
     root.mainloop()
 
 
