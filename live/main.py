@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from live.sdk_wrapper import (
     QHYCCDSDK, ControlID, QHYCCDError, error_string, platform_info,
-    SINGLE_MODE, LIVE_MODE, BayerPattern, parse_gps_from_frame,
+    LIVE_MODE, BayerPattern, parse_gps_from_frame,
 )
 
 
@@ -71,8 +71,6 @@ class QHYCamWindow(QMainWindow):
         self._captured_image = None
         self._camera_list = []
         self._current_read_mode = 1
-        self._full_w = 0
-        self._full_h = 0
         self._mem_len = 0
         self._params = {}
 
@@ -168,8 +166,6 @@ class QHYCamWindow(QMainWindow):
             ("Gain", ControlID.CONTROL_GAIN, "10"),
             ("Offset", ControlID.CONTROL_OFFSET, "140"),
             ("USB Traffic", ControlID.CONTROL_USBTRAFFIC, "30"),
-            ("Speed", ControlID.CONTROL_SPEED, "0"),
-            ("DDR Buffer", ControlID.CONTROL_DDR, "1"),
         ]
 
         for label_text, ctrl_id, default in param_specs:
@@ -214,76 +210,6 @@ class QHYCamWindow(QMainWindow):
         gl.addWidget(row)
         sl.addWidget(grp)
 
-        # --- ROI ---
-        grp = QGroupBox("Resolution / ROI")
-        gl = QVBoxLayout(grp)
-
-        row = QWidget()
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.addWidget(QLabel("X"))
-        self._res_x_entry = QLineEdit("0")
-        self._res_x_entry.setFixedWidth(60)
-        rl.addWidget(self._res_x_entry)
-        rl.addSpacing(6)
-        rl.addWidget(QLabel("Y"))
-        self._res_y_entry = QLineEdit("0")
-        self._res_y_entry.setFixedWidth(60)
-        rl.addWidget(self._res_y_entry)
-        rl.addStretch()
-        gl.addWidget(row)
-
-        row = QWidget()
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.addWidget(QLabel("W"))
-        self._res_w_entry = QLineEdit("0")
-        self._res_w_entry.setFixedWidth(60)
-        rl.addWidget(self._res_w_entry)
-        rl.addSpacing(6)
-        rl.addWidget(QLabel("H"))
-        self._res_h_entry = QLineEdit("0")
-        self._res_h_entry.setFixedWidth(60)
-        rl.addWidget(self._res_h_entry)
-        rl.addStretch()
-        gl.addWidget(row)
-
-        gl.addWidget(QPushButton("Set Resolution", clicked=self._set_resolution))
-        gl.addWidget(QPushButton("Fill Effective Area", clicked=self._fill_effective_area))
-        sl.addWidget(grp)
-
-        # --- Bin / Bits ---
-        grp = QGroupBox("Binning / Bits")
-        gl = QVBoxLayout(grp)
-
-        row = QWidget()
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.addWidget(QLabel("Bin X"))
-        self._binx_entry = QLineEdit("1")
-        self._binx_entry.setFixedWidth(60)
-        rl.addWidget(self._binx_entry)
-        rl.addWidget(QLabel("Bin Y"))
-        self._biny_entry = QLineEdit("1")
-        self._biny_entry.setFixedWidth(60)
-        rl.addWidget(self._biny_entry)
-        rl.addWidget(QPushButton("Set Bin", clicked=self._set_binning))
-        rl.addStretch()
-        gl.addWidget(row)
-
-        row = QWidget()
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(0, 4, 0, 0)
-        rl.addWidget(QLabel("Bits"))
-        self._bits_combo = QComboBox()
-        self._bits_combo.addItems(["8", "16"])
-        self._bits_combo.setFixedWidth(80)
-        rl.addWidget(self._bits_combo)
-        rl.addWidget(QPushButton("Set Bits", clicked=self._set_bits))
-        rl.addStretch()
-        gl.addWidget(row)
-        sl.addWidget(grp)
-
         # --- Capture ---
         grp = QGroupBox("Capture")
         gl = QVBoxLayout(grp)
@@ -291,9 +217,6 @@ class QHYCamWindow(QMainWindow):
         row = QWidget()
         rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
-        self._btn_single = QPushButton("Single Frame", clicked=self._capture_single)
-        self._btn_single.setEnabled(False)
-        rl.addWidget(self._btn_single)
         self._btn_live = QPushButton("Start Live", clicked=self._toggle_live)
         self._btn_live.setEnabled(False)
         rl.addWidget(self._btn_live)
@@ -440,8 +363,8 @@ class QHYCamWindow(QMainWindow):
             return
         self._log("InitQHYCCD: OK")
 
-        self.sdk.set_bits_mode(int(self._bits_combo.currentText()))
-        self._log(f"SetQHYCCDBitsMode({self._bits_combo.currentText()})")
+        self.sdk.set_bits_mode(16)
+        self._log("SetQHYCCDBitsMode(16)")
 
         chip = self.sdk.get_chip_info()
         if chip:
@@ -453,15 +376,8 @@ class QHYCamWindow(QMainWindow):
 
         area = self.sdk.get_effective_area()
         if area and area[2] > 0:
-            self._full_w, self._full_h = area[2], area[3]
-            self._res_x_entry.setText(str(area[0]))
-            self._res_y_entry.setText(str(area[1]))
-            self._res_w_entry.setText(str(area[2]))
-            self._res_h_entry.setText(str(area[3]))
             self.sdk.set_resolution(area[0], area[1], area[2], area[3])
             self._log(f"SetQHYCCDResolution: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
-        else:
-            self._full_w = self._full_h = 0
 
         self._mem_len = self.sdk.get_mem_length()
         self._log(f"GetQHYCCDMemLength: {self._mem_len} bytes")
@@ -472,7 +388,6 @@ class QHYCamWindow(QMainWindow):
             self.sdk.set_param(ControlID.CAM_GPS, 1.0)
             self._log("GPS: Enabled")
 
-        self._btn_single.setEnabled(True)
         self._btn_live.setEnabled(True)
         self._btn_close.setEnabled(True)
         self._enable_params(True)
@@ -490,7 +405,6 @@ class QHYCamWindow(QMainWindow):
         self._cam_color_label.setText("")
         self._gps_label.setText("GPS: --")
         self._btn_close.setEnabled(False)
-        self._btn_single.setEnabled(False)
         self._btn_live.setEnabled(False)
         self._btn_save.setEnabled(False)
         self._enable_params(False)
@@ -552,111 +466,6 @@ class QHYCamWindow(QMainWindow):
             self._log(f"Current temp: {t:.1f} C, PWM: {p}")
 
     # ==============================================================
-    # Resolution / ROI
-    # ==============================================================
-    def _set_resolution(self):
-        if not self._check_sdk() or not self.sdk.handle:
-            return
-        try:
-            x = int(self._res_x_entry.text() or 0)
-            y = int(self._res_y_entry.text() or 0)
-            w = int(self._res_w_entry.text() or 0)
-            h = int(self._res_h_entry.text() or 0)
-        except ValueError:
-            self._log("ERROR: Invalid resolution values.")
-            return
-        ret = self.sdk.set_resolution(x, y, w, h)
-        if ret == QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"Resolution set: ({x},{y}) {w}x{h}")
-        else:
-            self._log(f"ERROR set resolution: {error_string(ret)}")
-
-    def _fill_effective_area(self):
-        if not self._check_sdk() or not self.sdk.handle:
-            return
-        area = self.sdk.get_effective_area()
-        if area:
-            self._res_x_entry.setText(str(area[0]))
-            self._res_y_entry.setText(str(area[1]))
-            self._res_w_entry.setText(str(area[2]))
-            self._res_h_entry.setText(str(area[3]))
-            self._log(f"Effective area: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
-
-    # ==============================================================
-    # Binning / Bits
-    # ==============================================================
-    def _set_binning(self):
-        if not self._check_sdk() or not self.sdk.handle:
-            return
-        try:
-            bx = int(self._binx_entry.text())
-            by = int(self._biny_entry.text())
-        except ValueError:
-            self._log("ERROR: Invalid bin values.")
-            return
-        ret = self.sdk.set_bin_mode(bx, by)
-        if ret == QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"Binning set: {bx}x{by}")
-        else:
-            self._log(f"ERROR set binning: {error_string(ret)}")
-
-    def _set_bits(self):
-        if not self._check_sdk() or not self.sdk.handle:
-            return
-        bits = int(self._bits_combo.currentText())
-        ret = self.sdk.set_bits_mode(bits)
-        if ret == QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"Bits mode set: {bits}bit")
-        else:
-            self._log(f"ERROR set bits: {error_string(ret)}")
-
-    # ==============================================================
-    # Single frame capture
-    # ==============================================================
-    def _capture_single(self):
-        if not self.sdk.handle:
-            return
-
-        self._log("Single frame: switching to SINGLE_MODE...")
-
-        self.sdk.set_stream_mode(SINGLE_MODE)
-        ret = self.sdk.init()
-        if ret != QHYCCDError.QHYCCD_SUCCESS:
-            self._log(f"ERROR re-init: {error_string(ret)}")
-            return
-
-        ret = self.sdk.exp_single_frame()
-        if ret == QHYCCDError.QHYCCD_READ_DIRECTLY:
-            self._log("READ_DIRECTLY mode, reading...")
-            self._read_single_frame(after_switch_back=True)
-        elif ret == QHYCCDError.QHYCCD_SUCCESS:
-            self._log("Exposure started, waiting...")
-            QTimer.singleShot(100, lambda: self._read_single_frame(after_switch_back=True))
-        else:
-            self._log(f"ERROR exposure: {error_string(ret)}")
-            self._restore_live_mode()
-
-    def _read_single_frame(self, after_switch_back=False):
-        result = self.sdk.get_single_frame()
-        if result is None:
-            self._log("Waiting for frame...")
-            QTimer.singleShot(300, lambda: self._read_single_frame(after_switch_back))
-            return
-        w, h, bpp, ch, imgdata = result
-        self._log(f"Frame: {w}x{h}, {bpp}bit, {ch}ch, {len(imgdata)} bytes")
-        self._display_image(w, h, bpp, ch, imgdata)
-        self._btn_save.setEnabled(True)
-
-        if after_switch_back:
-            self._restore_live_mode()
-
-    def _restore_live_mode(self):
-        self._log("Restoring LIVE_MODE...")
-        self.sdk.set_stream_mode(LIVE_MODE)
-        self.sdk.init()
-        self._log("LIVE_MODE restored.")
-
-    # ==============================================================
     # Live capture
     # ==============================================================
     def _toggle_live(self):
@@ -676,7 +485,6 @@ class QHYCamWindow(QMainWindow):
             return
         self._live_running = True
         self._btn_live.setText("Stop Live")
-        self._btn_single.setEnabled(False)
         self._btn_save.setEnabled(True)
         self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
         self._live_thread.start()
@@ -699,7 +507,6 @@ class QHYCamWindow(QMainWindow):
             self._live_thread = None
         self.sdk.stop_live()
         self._btn_live.setText("Start Live")
-        self._btn_single.setEnabled(True)
         self._log("Live video stopped.")
 
     def _on_live_frame(self, w, h, bpp, ch, imgdata):
