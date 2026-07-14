@@ -1,0 +1,580 @@
+import os
+import sys
+import time
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGroupBox, QLabel, QLineEdit, QPushButton,
+    QScrollArea, QSplitter, QPlainTextEdit, QListWidget, QFileDialog,
+)
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QImage, QPixmap
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from live.sdk_wrapper import (
+    QHYCCDSDK, ControlID, QHYCCDError, error_string, platform_info,
+    SINGLE_MODE, BayerPattern, parse_gps_from_frame,
+)
+
+
+class ImageLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._original_pixmap = None
+        self.setMinimumSize(100, 100)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background-color: #1a1a1a;")
+
+    def set_display_pixmap(self, pixmap):
+        self._original_pixmap = pixmap
+        self._fit_to_label()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._original_pixmap:
+            self._fit_to_label()
+
+    def _fit_to_label(self):
+        if self._original_pixmap is None:
+            return
+        lw = self.width()
+        lh = self.height()
+        if lw < 10 or lh < 10:
+            return
+        pw = self._original_pixmap.width()
+        ph = self._original_pixmap.height()
+        scale = min(lw / pw, lh / ph, 1.0)
+        nw, nh = int(pw * scale), int(ph * scale)
+        scaled = self._original_pixmap.scaled(
+            nw, nh, Qt.KeepAspectRatio, Qt.FastTransformation,
+        )
+        self.setPixmap(scaled)
+
+
+class QHYCamSingleWindow(QMainWindow):
+    single_frame_signal = Signal(int, int, int, int, bytes)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("QHYCCD Camera Single")
+        self.resize(1100, 750)
+        self.setMinimumSize(900, 600)
+
+        self.sdk = QHYCCDSDK()
+        self._camera_list = []
+        self._captured_image = None
+        self._current_read_mode = 1
+        self._mem_len = 0
+        self._params = {}
+
+        self.single_frame_signal.connect(self._on_single_frame)
+
+        self._build_ui()
+        self._refresh_sdk_status()
+        QTimer.singleShot(200, self._auto_init)
+
+    # ==============================================================
+    # UI Construction
+    # ==============================================================
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
+
+        left = QWidget()
+        left.setMaximumWidth(420)
+        splitter.addWidget(left)
+
+        right = QWidget()
+        splitter.addWidget(right)
+
+        self._build_left_panel(left)
+        self._build_right_panel(right)
+
+    def _build_left_panel(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(scroll)
+
+        sw = QWidget()
+        scroll.setWidget(sw)
+        sl = QVBoxLayout(sw)
+        sl.setContentsMargins(6, 2, 6, 2)
+        sl.setSpacing(4)
+
+        # --- SDK Status ---
+        grp = QGroupBox("SDK Status")
+        gl = QVBoxLayout(grp)
+        self._sdk_status_label = QLabel("SDK: Not loaded")
+        self._sdk_status_label.setStyleSheet("color: gray;")
+        gl.addWidget(self._sdk_status_label)
+        self._sdk_ver_label = QLabel("")
+        self._sdk_ver_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._sdk_ver_label)
+        self._platform_label = QLabel("")
+        self._platform_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._platform_label)
+        sl.addWidget(grp)
+
+        # --- Camera Scan ---
+        grp = QGroupBox("Camera")
+        gl = QVBoxLayout(grp)
+        self._cam_listwidget = QListWidget()
+        self._cam_listwidget.setMaximumHeight(80)
+        gl.addWidget(self._cam_listwidget)
+        sl.addWidget(grp)
+
+        # --- Camera Operations ---
+        grp = QGroupBox("Camera Control")
+        gl = QVBoxLayout(grp)
+        hr = QHBoxLayout()
+        self._btn_close = QPushButton("Close Camera")
+        self._btn_close.clicked.connect(self._close_camera)
+        self._btn_close.setEnabled(False)
+        hr.addWidget(self._btn_close)
+        hr.addStretch()
+        gl.addLayout(hr)
+        self._cam_model_label = QLabel("Model: --")
+        gl.addWidget(self._cam_model_label)
+        self._cam_color_label = QLabel("")
+        gl.addWidget(self._cam_color_label)
+        self._gps_label = QLabel("GPS: --")
+        self._gps_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._gps_label)
+        sl.addWidget(grp)
+
+        # --- Parameters ---
+        grp = QGroupBox("Parameters")
+        gl = QVBoxLayout(grp)
+        param_specs = [
+            ("Exposure (us)", ControlID.CONTROL_EXPOSURE, "100000"),
+            ("Gain", ControlID.CONTROL_GAIN, "10"),
+            ("Offset", ControlID.CONTROL_OFFSET, "140"),
+            ("USB Traffic", ControlID.CONTROL_USBTRAFFIC, "30"),
+        ]
+
+        for label_text, ctrl_id, default in param_specs:
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 1, 0, 1)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(130)
+            rl.addWidget(lbl)
+            entry = QLineEdit(default)
+            entry.setFixedWidth(90)
+            rl.addWidget(entry)
+            b1 = QPushButton("Set")
+            b1.setFixedWidth(40)
+            b1.clicked.connect(lambda checked, cid=ctrl_id, e=entry: self._set_param(cid, e))
+            rl.addWidget(b1)
+            b2 = QPushButton("Get")
+            b2.setFixedWidth(40)
+            b2.clicked.connect(lambda checked, cid=ctrl_id, e=entry: self._get_param(cid, e))
+            rl.addWidget(b2)
+            rl.addStretch()
+            gl.addWidget(row)
+            self._params[ctrl_id] = entry
+
+        # --- Temperature ---
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 1, 0, 1)
+        rl.addWidget(QLabel("Target Temp (C)"))
+        self._temp_entry = QLineEdit("0")
+        self._temp_entry.setFixedWidth(90)
+        rl.addWidget(self._temp_entry)
+        b1 = QPushButton("Set")
+        b1.setFixedWidth(40)
+        b1.clicked.connect(self._set_temp)
+        rl.addWidget(b1)
+        b2 = QPushButton("Get")
+        b2.setFixedWidth(40)
+        b2.clicked.connect(self._get_temp)
+        rl.addWidget(b2)
+        rl.addStretch()
+        gl.addWidget(row)
+        sl.addWidget(grp)
+
+        # --- Capture ---
+        grp = QGroupBox("Capture")
+        gl = QVBoxLayout(grp)
+
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        self._btn_single = QPushButton("Single Frame", clicked=self._capture_single)
+        self._btn_single.setEnabled(False)
+        rl.addWidget(self._btn_single)
+        rl.addStretch()
+        gl.addWidget(row)
+
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 4, 0, 0)
+        self._btn_save = QPushButton("Save Image", clicked=self._save_image)
+        self._btn_save.setEnabled(False)
+        rl.addWidget(self._btn_save)
+        rl.addStretch()
+        gl.addWidget(row)
+
+        self._capture_info_label = QLabel("")
+        self._capture_info_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._capture_info_label)
+        sl.addWidget(grp)
+
+        sl.addStretch()
+
+    def _build_right_panel(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        rs = QSplitter(Qt.Vertical)
+        layout.addWidget(rs)
+
+        vf = QGroupBox("Image View")
+        vl = QVBoxLayout(vf)
+        vl.setContentsMargins(4, 4, 4, 4)
+        self._image_label = ImageLabel()
+        vl.addWidget(self._image_label)
+        rs.addWidget(vf)
+
+        lf = QGroupBox("Log")
+        ll = QVBoxLayout(lf)
+        ll.setContentsMargins(4, 4, 4, 4)
+        lh = QHBoxLayout()
+        lh.addStretch()
+        lh.addWidget(QPushButton("Clear", clicked=self._clear_log))
+        ll.addLayout(lh)
+        self._log_text = QPlainTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setMaximumBlockCount(5000)
+        self._log_text.setStyleSheet(
+            "font-family: Consolas; font-size: 9pt; background-color: #1e1e1e; color: #d4d4d4;"
+        )
+        ll.addWidget(self._log_text)
+        rs.addWidget(lf)
+
+    # ==============================================================
+    # Logging
+    # ==============================================================
+    def _log(self, msg):
+        self._log_text.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+    def _clear_log(self):
+        self._log_text.clear()
+
+    # ==============================================================
+    # SDK Management
+    # ==============================================================
+    def _refresh_sdk_status(self):
+        pinfo = platform_info()
+        self._platform_label.setText(
+            f"Platform: {pinfo['system']}  |  Library: {pinfo['lib_name']}"
+        )
+        self._sdk_status_label.setText("SDK: Ready")
+        ver = self.sdk.get_sdk_version_string()
+        self._sdk_ver_label.setText(f"SDK Version: {ver}")
+
+    def _check_sdk(self):
+        if not self.sdk.lib:
+            try:
+                self.sdk.init_resource()
+            except RuntimeError as e:
+                self._log(f"SDK init failed: {e}")
+                return False
+        return True
+
+    def _auto_init(self):
+        if not self._check_sdk():
+            self._log("SDK not available, connect a QHYCCD camera.")
+            return
+
+        self._log("=== Auto Init ===")
+
+        ret = self.sdk.init_resource()
+        if ret != QHYCCDError.QHYCCD_SUCCESS:
+            self._log(f"ERROR: InitQHYCCDResource: {error_string(ret)}")
+            return
+        self._log("InitQHYCCDResource: OK")
+        self.sdk.enable_message(True)
+
+        count = self.sdk.scan()
+        self._log(f"ScanQHYCCD: {count} camera(s)")
+        if count == 0:
+            self._log("No camera found.")
+            self.sdk.release_resource()
+            return
+
+        self._camera_list.clear()
+        self._cam_listwidget.clear()
+        for i in range(count):
+            cid = self.sdk.get_camera_id(i)
+            model = self.sdk.get_camera_model(cid) if cid else "Unknown"
+            self._cam_listwidget.addItem(f"[{i}] {model} ({cid})")
+            self._camera_list.append(cid)
+
+        cid = self._camera_list[0]
+        self._log(f"OpenQHYCCD({cid})...")
+        handle = self.sdk.open(cid)
+        if not handle:
+            self._log("ERROR: OpenQHYCCD failed.")
+            self.sdk.release_resource()
+            return
+
+        model = self.sdk.get_camera_model(cid)
+        fw = self.sdk.get_fw_version()
+        self._cam_model_label.setText(f"Model: {model}  FW: {fw}")
+        self._log(f"Camera opened: {model}, FW: {fw}")
+
+        bayer = self.sdk.get_color_bayer()
+        color_str = f"Color ({bayer.name})" if bayer else "Mono"
+        extra = []
+        if self.sdk.has_cooler():
+            extra.append("Cooler")
+        if self.sdk.has_gps():
+            extra.append("GPS")
+        self._cam_color_label.setText(f"{color_str}  {' | '.join(extra)}")
+
+        self.sdk.set_read_mode(self._current_read_mode)
+        self._log(f"SetQHYCCDReadMode({self._current_read_mode})")
+        self.sdk.set_stream_mode(SINGLE_MODE)
+        self._log("SetQHYCCDStreamMode(SINGLE_MODE)")
+
+        ret = self.sdk.init()
+        if ret != QHYCCDError.QHYCCD_SUCCESS:
+            self._log(f"ERROR: InitQHYCCD: {error_string(ret)}")
+            return
+        self._log("InitQHYCCD: OK")
+
+        self.sdk.set_bits_mode(16)
+        self._log("SetQHYCCDBitsMode(16)")
+
+        chip = self.sdk.get_chip_info()
+        if chip:
+            cw, ch, iw, ih, pw, ph, bpp = chip
+            self._log(
+                f"Chip: {cw:.1f}x{ch:.1f}mm, Max: {iw}x{ih}, "
+                f"Pixel: {pw:.1f}x{ph:.1f}um, {bpp}bit"
+            )
+            self.sdk.set_resolution(0, 0, iw, ih)
+            self._log(f"SetQHYCCDResolution: (0,0) {iw}x{ih}")
+
+        self._mem_len = self.sdk.get_mem_length()
+        self._log(f"GetQHYCCDMemLength: {self._mem_len} bytes")
+
+        self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
+
+        if self.sdk.has_gps():
+            self.sdk.set_param(ControlID.CAM_GPS, 1.0)
+            self._log("GPS: Enabled")
+
+        self._btn_single.setEnabled(True)
+        self._btn_close.setEnabled(True)
+        self._enable_params(True)
+        self._log("=== Ready ===")
+
+    def _close_camera(self):
+        if self.sdk.handle:
+            self._log("Closing camera...")
+            self.sdk.close()
+            self._log("Camera closed.")
+
+        self._cam_model_label.setText("Model: --")
+        self._cam_color_label.setText("")
+        self._gps_label.setText("GPS: --")
+        self._btn_close.setEnabled(False)
+        self._btn_single.setEnabled(False)
+        self._btn_save.setEnabled(False)
+        self._enable_params(False)
+
+    def _enable_params(self, enabled):
+        for entry in self._params.values():
+            entry.setEnabled(enabled)
+
+    # ==============================================================
+    # Parameters
+    # ==============================================================
+    def _set_param(self, control_id, entry):
+        if not self._check_sdk() or not self.sdk.handle:
+            return
+        try:
+            val = float(entry.text())
+        except ValueError:
+            self._log("ERROR: Invalid numeric value.")
+            return
+        ctrl_name = ControlID(control_id).name
+        ret = self.sdk.set_param(control_id, val)
+        if ret == QHYCCDError.QHYCCD_SUCCESS:
+            self._log(f"Set {ctrl_name} = {val}")
+        else:
+            self._log(f"ERROR set {ctrl_name}: {error_string(ret)}")
+
+    def _get_param(self, control_id, entry):
+        if not self._check_sdk() or not self.sdk.handle:
+            return
+        val = self.sdk.get_param(control_id)
+        ctrl_name = ControlID(control_id).name
+        if val is not None:
+            entry.setText(str(int(val)) if val == int(val) else f"{val:.2f}")
+            self._log(f"Get {ctrl_name} = {val}")
+        else:
+            self._log(f"ERROR get {ctrl_name}: no value")
+
+    def _set_temp(self):
+        if not self._check_sdk() or not self.sdk.handle:
+            return
+        try:
+            val = float(self._temp_entry.text())
+        except ValueError:
+            self._log("ERROR: Invalid temperature value.")
+            return
+        ret = self.sdk.control_temp(val)
+        if ret == QHYCCDError.QHYCCD_SUCCESS:
+            self._log(f"Set target temp = {val} C")
+        else:
+            self._log(f"ERROR set temp: {error_string(ret)}")
+
+    def _get_temp(self):
+        if not self._check_sdk() or not self.sdk.handle:
+            return
+        t = self.sdk.get_temp()
+        p = self.sdk.get_cooler_pwm()
+        if t is not None:
+            self._temp_entry.setText(f"{t:.1f}")
+            self._log(f"Current temp: {t:.1f} C, PWM: {p}")
+
+    # ==============================================================
+    # Single frame capture
+    # ==============================================================
+    def _capture_single(self):
+        if not self.sdk.handle:
+            return
+
+        self._log("Starting single frame exposure...")
+        self._btn_single.setEnabled(False)
+
+        ret = self.sdk.exp_single_frame()
+        if ret == QHYCCDError.QHYCCD_READ_DIRECTLY:
+            self._log("READ_DIRECTLY mode, reading frame...")
+            self._poll_single_frame()
+        elif ret == QHYCCDError.QHYCCD_SUCCESS:
+            self._log(f"Exposing {self._get_exposure_us()}us, waiting...")
+            QTimer.singleShot(200, self._poll_single_frame)
+        else:
+            self._log(f"ERROR exposure: {error_string(ret)}")
+            self._btn_single.setEnabled(True)
+
+    def _get_exposure_us(self):
+        try:
+            return int(float(self._params[ControlID.CONTROL_EXPOSURE].text()))
+        except (ValueError, KeyError):
+            return 100000
+
+    def _poll_single_frame(self):
+        result = self.sdk.get_single_frame()
+        if result is None:
+            self._log("Waiting for frame...")
+            QTimer.singleShot(self._get_exposure_us() // 1000 + 100, self._poll_single_frame)
+            return
+        w, h, bpp, ch, imgdata = result
+        self._log(f"Frame: {w}x{h}, {bpp}bit, {ch}ch, {len(imgdata)} bytes")
+        self._display_image(w, h, bpp, ch, imgdata)
+        self._btn_save.setEnabled(True)
+        self._btn_single.setEnabled(True)
+
+    # ==============================================================
+    # Image display & save
+    # ==============================================================
+    def _parse_frame_gps(self, imgdata, w, bpp, ch):
+        gps = parse_gps_from_frame(imgdata, w, bpp, ch)
+        if gps and gps.get("locked"):
+            self._gps_label.setText(
+                f"GPS: {gps['year']}-{gps['month']:02d}-{gps['day']:02d} "
+                f"{gps['hour']:02d}:{gps['minute']:02d}:{gps['second']:02d} UTC  "
+                f"Seq: {gps['seq']}"
+            )
+        elif gps:
+            self._gps_label.setText(f"GPS: Unlocked (seq={gps['seq']})")
+
+    def _display_image(self, w, h, bpp, ch, imgdata):
+        self._parse_frame_gps(imgdata, w, bpp, ch)
+        try:
+            dtype = np.uint16 if bpp == 16 else np.uint8
+            shape = (h, w) if ch == 1 else (h, w, ch)
+            arr = np.frombuffer(imgdata, dtype=dtype).reshape(shape)
+
+            if bpp == 16:
+                arr = (arr >> 8).astype(np.uint8)
+            if ch == 1:
+                arr = np.ascontiguousarray(arr)
+
+            img = Image.fromarray(arr)
+            self._captured_image = img
+
+            w_img, h_img = img.size
+            raw_bytes = img.tobytes("raw", img.mode)
+            if img.mode == "L":
+                fmt = QImage.Format_Grayscale8
+                bpl = w_img
+            elif img.mode == "RGB":
+                fmt = QImage.Format_RGB888
+                bpl = w_img * 3
+            else:
+                img_rgb = img.convert("RGB")
+                raw_bytes = img_rgb.tobytes("raw", "RGB")
+                fmt = QImage.Format_RGB888
+                bpl = img_rgb.width
+
+            qimg = QImage(raw_bytes, w_img, h_img, bpl, fmt)
+            pixmap = QPixmap.fromImage(qimg)
+            self._image_label.set_display_pixmap(pixmap)
+            self._capture_info_label.setText(f"Image: {w}x{h}")
+        except Exception as e:
+            self._log(f"ERROR rendering image: {e}")
+
+    def _on_single_frame(self, w, h, bpp, ch, imgdata):
+        self._display_image(w, h, bpp, ch, imgdata)
+        self._btn_save.setEnabled(True)
+        self._btn_single.setEnabled(True)
+
+    def _save_image(self):
+        if self._captured_image is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Image",
+            filter="PNG Image (*.png);;FITS (*.fits);;TIFF (*.tiff);;All (*.*)",
+        )
+        if path:
+            self._captured_image.save(path)
+            self._log(f"Image saved: {path}")
+
+    # ==============================================================
+    # Cleanup
+    # ==============================================================
+    def closeEvent(self, event):
+        if self.sdk.handle:
+            self.sdk.close()
+        self.sdk.release_resource()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = QHYCamSingleWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
