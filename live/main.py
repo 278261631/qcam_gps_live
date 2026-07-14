@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from live.sdk_wrapper import (
     QHYCCDSDK, ControlID, QHYCCDError, error_string, platform_info,
-    SINGLE_MODE, LIVE_MODE, BayerPattern,
+    SINGLE_MODE, LIVE_MODE, BayerPattern, parse_gps_from_frame,
 )
 
 
@@ -101,6 +101,8 @@ class QHYCamApp:
         ttk.Label(camf, textvariable=self._cam_model_var).pack(anchor=tk.W, pady=(4, 0))
         self._cam_color_var = tk.StringVar(value="")
         ttk.Label(camf, textvariable=self._cam_color_var).pack(anchor=tk.W)
+        self._gps_var = tk.StringVar(value="GPS: --")
+        ttk.Label(camf, textvariable=self._gps_var, foreground="#555").pack(anchor=tk.W)
 
         # --- Parameters ---
         paramf = ttk.LabelFrame(frame, text="Parameters", padding=6)
@@ -353,6 +355,11 @@ class QHYCamApp:
         # 7. Default exposure
         self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
 
+        # Enable GPS on cameras that support it (CAM_GPS)
+        if self.sdk.has_gps():
+            self.sdk.set_param(ControlID.CAM_GPS, 1.0)
+            self._log("GPS: Enabled")
+
         self._btn_single.configure(state=tk.NORMAL)
         self._btn_live.configure(state=tk.NORMAL)
         self._btn_close.configure(state=tk.NORMAL)
@@ -369,6 +376,7 @@ class QHYCamApp:
 
         self._cam_model_var.set("Model: --")
         self._cam_color_var.set("")
+        self._gps_var.set("GPS: --")
         self._btn_close.configure(state=tk.DISABLED)
         self._btn_single.configure(state=tk.DISABLED)
         self._btn_live.configure(state=tk.DISABLED)
@@ -590,7 +598,19 @@ class QHYCamApp:
     # ==============================================================
     # Image display & save
     # ==============================================================
+    def _parse_frame_gps(self, imgdata, w, bpp, ch):
+        gps = parse_gps_from_frame(imgdata, w, bpp, ch)
+        if gps and gps.get("locked"):
+            self._gps_var.set(
+                f"GPS: {gps['year']}-{gps['month']:02d}-{gps['day']:02d} "
+                f"{gps['hour']:02d}:{gps['minute']:02d}:{gps['second']:02d} UTC  "
+                f"Seq: {gps['seq']}"
+            )
+        elif gps:
+            self._gps_var.set(f"GPS: Unlocked (seq={gps['seq']})")
+
     def _display_image(self, w, h, bpp, ch, imgdata):
+        self._parse_frame_gps(imgdata, w, bpp, ch)
         try:
             dtype = np.uint16 if bpp == 16 else np.uint8
             shape = (h, w) if ch == 1 else (h, w, ch)

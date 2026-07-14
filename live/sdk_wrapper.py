@@ -864,6 +864,80 @@ class QHYCCDSDK:
 
 
 # ---------------------------------------------------------------------------
+# GPS parser (pure Python reimplementation of ParseGPSFromFrame)
+# ---------------------------------------------------------------------------
+
+
+def _jd_to_date(jd):
+    """Convert Julian Date to (year, month, day)."""
+    jd += 0.5
+    z = int(jd)
+    a = z
+    if z >= 2299161:
+        alpha = int((z - 1867216.25) / 36524.25)
+        a = z + 1 + alpha - int(alpha / 4)
+    b = a + 1524
+    c = int((b - 122.1) / 365.25)
+    d = int(365.25 * c)
+    e = int((b - d) / 30.6001)
+    dd = b - d - int(30.6001 * e)
+    mm = e - 1 if e < 14 else e - 13
+    yy = c - 4716 if mm > 2 else c - 4715
+    return (yy, mm, dd)
+
+
+def _decode_js(js_sec, timezone=0):
+    """Decode Julian Seconds to (JD, hour, minute, second)."""
+    JD = js_sec / 3600.0 / 24.0 + 2450000.0
+    k = js_sec % (3600 * 24)
+    h = int(k / 3600)
+    k = k % 3600
+    m = int(k / 60)
+    k = k % 60
+    s = int(k)
+    JD = JD + 0.5 + ((h + timezone) * 3600.0 + m * 60.0 + s) / 3600.0 / 24.0
+    return (JD, h, m, s)
+
+
+def parse_gps_from_frame(imgdata, w, bpp, channels):
+    """Parse GPS data from the first row of image frame data.
+
+    Matches SDK's ParseGPSFromFrame function logic.
+    Returns dict with keys:
+      seq, lat, lon, locked, year, month, day, hour, minute, second
+    or None if no valid GPS data.
+    """
+    if len(imgdata) < 64:
+        return None
+
+    gps_buf = bytearray(64)
+    row_bytes = w * channels
+    copy_len = min(64, row_bytes)
+    gps_buf[:copy_len] = imgdata[:copy_len]
+
+    seq  = (gps_buf[0] * 0x1000000 + gps_buf[1] * 0x10000 +
+            gps_buf[2] * 0x100 + gps_buf[3])
+    lat  = (gps_buf[9] * 0x1000000 + gps_buf[10] * 0x10000 +
+            gps_buf[11] * 0x100 + gps_buf[12])
+    lon  = (gps_buf[13] * 0x1000000 + gps_buf[14] * 0x10000 +
+            gps_buf[15] * 0x100 + gps_buf[16])
+    start_flag = gps_buf[17]
+    start_sec  = (gps_buf[18] * 0x1000000 + gps_buf[19] * 0x10000 +
+                  gps_buf[20] * 0x100 + gps_buf[21])
+
+    locked = (start_flag == 51)
+
+    jd, hour, minute, second = _decode_js(start_sec)
+    year, month, day = _jd_to_date(jd)
+
+    return {
+        "seq": seq, "lat": lat, "lon": lon, "locked": locked,
+        "year": year, "month": month, "day": day,
+        "hour": hour, "minute": minute, "second": second,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def error_string(code):
