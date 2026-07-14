@@ -2,10 +2,17 @@ import os
 import sys
 import time
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog
-from PIL import Image, ImageTk
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
+    QScrollArea, QSplitter, QPlainTextEdit, QListWidget, QFileDialog,
+)
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QImage, QPixmap
 import numpy as np
+from PIL import Image
+from PIL.ImageQt import ImageQt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,234 +22,352 @@ from live.sdk_wrapper import (
 )
 
 
-class QHYCamApp:
+class ImageLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._original_pixmap = None
+        self.setMinimumSize(100, 100)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background-color: #1a1a1a;")
 
-    def __init__(self, root):
-        self.root = root
-        self.root.title("QHYCCD Camera Live")
-        self.root.geometry("1100x750")
-        self.root.minsize(900, 600)
+    def set_display_pixmap(self, pixmap):
+        self._original_pixmap = pixmap
+        self._fit_to_label()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._original_pixmap:
+            self._fit_to_label()
+
+    def _fit_to_label(self):
+        if self._original_pixmap is None:
+            return
+        lw = self.width()
+        lh = self.height()
+        if lw < 10 or lh < 10:
+            return
+        pw = self._original_pixmap.width()
+        ph = self._original_pixmap.height()
+        scale = min(lw / pw, lh / ph, 1.0)
+        nw, nh = int(pw * scale), int(ph * scale)
+        scaled = self._original_pixmap.scaled(
+            nw, nh, Qt.KeepAspectRatio, Qt.FastTransformation,
+        )
+        self.setPixmap(scaled)
+
+
+class QHYCamWindow(QMainWindow):
+    live_frame_signal = Signal(int, int, int, int, bytes)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("QHYCCD Camera Live")
+        self.resize(1100, 750)
+        self.setMinimumSize(900, 600)
 
         self.sdk = QHYCCDSDK()
         self._live_running = False
         self._live_thread = None
         self._captured_image = None
-        self._photo = None
         self._camera_list = []
         self._current_read_mode = 1
+        self._full_w = 0
+        self._full_h = 0
+        self._mem_len = 0
+        self._params = {}
+
+        self.live_frame_signal.connect(self._on_live_frame)
 
         self._build_ui()
         self._refresh_sdk_status()
-        self.root.after(200, self._auto_init)
+        QTimer.singleShot(200, self._auto_init)
 
     # ==============================================================
     # UI Construction
     # ==============================================================
     def _build_ui(self):
-        main_pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_pw.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(4, 4, 4, 4)
 
-        left = ttk.Frame(main_pw, width=360)
-        main_pw.add(left, weight=0)
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
 
-        right = ttk.Frame(main_pw)
-        main_pw.add(right, weight=1)
+        left = QWidget()
+        left.setMaximumWidth(420)
+        splitter.addWidget(left)
+
+        right = QWidget()
+        splitter.addWidget(right)
 
         self._build_left_panel(left)
         self._build_right_panel(right)
 
     def _build_left_panel(self, parent):
-        canvas = tk.Canvas(parent, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
-        scrolly = ttk.Frame(canvas)
-        scrolly.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrolly, anchor="nw", tags="inner")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        def _bind_mousewheel(event):
-            canvas.bind_all("<MouseWheel>", lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"))
-        canvas.bind("<Enter>", _bind_mousewheel)
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(scroll)
 
-        frame = ttk.Frame(scrolly)
-        frame.pack(fill=tk.X, padx=6, pady=2)
+        sw = QWidget()
+        scroll.setWidget(sw)
+        sl = QVBoxLayout(sw)
+        sl.setContentsMargins(6, 2, 6, 2)
+        sl.setSpacing(4)
 
         # --- SDK Status ---
-        sdkf = ttk.LabelFrame(frame, text="SDK Status", padding=6)
-        sdkf.pack(fill=tk.X, pady=(0, 4))
-
-        self._sdk_status_var = tk.StringVar(value="SDK: Not loaded")
-        ttk.Label(sdkf, textvariable=self._sdk_status_var, foreground="gray").pack(anchor=tk.W)
-        self._sdk_ver_var = tk.StringVar(value="")
-        ttk.Label(sdkf, textvariable=self._sdk_ver_var, foreground="#555").pack(anchor=tk.W)
-        self._platform_var = tk.StringVar(value="")
-        ttk.Label(sdkf, textvariable=self._platform_var, foreground="#555").pack(anchor=tk.W)
+        grp = QGroupBox("SDK Status")
+        gl = QVBoxLayout(grp)
+        self._sdk_status_label = QLabel("SDK: Not loaded")
+        self._sdk_status_label.setStyleSheet("color: gray;")
+        gl.addWidget(self._sdk_status_label)
+        self._sdk_ver_label = QLabel("")
+        self._sdk_ver_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._sdk_ver_label)
+        self._platform_label = QLabel("")
+        self._platform_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._platform_label)
+        sl.addWidget(grp)
 
         # --- Camera Scan ---
-        scanf = ttk.LabelFrame(frame, text="Camera", padding=6)
-        scanf.pack(fill=tk.X, pady=4)
-
-        self._cam_listbox = tk.Listbox(scanf, height=4, exportselection=False)
-        self._cam_listbox.pack(fill=tk.X, pady=(0, 0))
+        grp = QGroupBox("Camera")
+        gl = QVBoxLayout(grp)
+        self._cam_listwidget = QListWidget()
+        self._cam_listwidget.setMaximumHeight(80)
+        gl.addWidget(self._cam_listwidget)
+        sl.addWidget(grp)
 
         # --- Camera Operations ---
-        camf = ttk.LabelFrame(frame, text="Camera Control", padding=6)
-        camf.pack(fill=tk.X, pady=4)
-
-        self._cam_btn_frame = ttk.Frame(camf)
-        self._cam_btn_frame.pack(fill=tk.X)
-        self._btn_close = ttk.Button(self._cam_btn_frame, text="Close Camera",
-                                      command=self._close_camera, state=tk.DISABLED)
-        self._btn_close.pack(side=tk.LEFT)
-
-        self._cam_model_var = tk.StringVar(value="Model: --")
-        ttk.Label(camf, textvariable=self._cam_model_var).pack(anchor=tk.W, pady=(4, 0))
-        self._cam_color_var = tk.StringVar(value="")
-        ttk.Label(camf, textvariable=self._cam_color_var).pack(anchor=tk.W)
-        self._gps_var = tk.StringVar(value="GPS: --")
-        ttk.Label(camf, textvariable=self._gps_var, foreground="#555").pack(anchor=tk.W)
+        grp = QGroupBox("Camera Control")
+        gl = QVBoxLayout(grp)
+        hr = QHBoxLayout()
+        self._btn_close = QPushButton("Close Camera")
+        self._btn_close.clicked.connect(self._close_camera)
+        self._btn_close.setEnabled(False)
+        hr.addWidget(self._btn_close)
+        hr.addStretch()
+        gl.addLayout(hr)
+        self._cam_model_label = QLabel("Model: --")
+        gl.addWidget(self._cam_model_label)
+        self._cam_color_label = QLabel("")
+        gl.addWidget(self._cam_color_label)
+        self._gps_label = QLabel("GPS: --")
+        self._gps_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._gps_label)
+        sl.addWidget(grp)
 
         # --- Parameters ---
-        paramf = ttk.LabelFrame(frame, text="Parameters", padding=6)
-        paramf.pack(fill=tk.X, pady=4)
-
-        self._params = {}
+        grp = QGroupBox("Parameters")
+        gl = QVBoxLayout(grp)
         param_specs = [
-            ("Exposure (us)", ControlID.CONTROL_EXPOSURE, 100000),
-            ("Gain", ControlID.CONTROL_GAIN, 10),
-            ("Offset", ControlID.CONTROL_OFFSET, 140),
-            ("USB Traffic", ControlID.CONTROL_USBTRAFFIC, 30),
-            ("Speed", ControlID.CONTROL_SPEED, 0),
-            ("DDR Buffer", ControlID.CONTROL_DDR, 1),
+            ("Exposure (us)", ControlID.CONTROL_EXPOSURE, "100000"),
+            ("Gain", ControlID.CONTROL_GAIN, "10"),
+            ("Offset", ControlID.CONTROL_OFFSET, "140"),
+            ("USB Traffic", ControlID.CONTROL_USBTRAFFIC, "30"),
+            ("Speed", ControlID.CONTROL_SPEED, "0"),
+            ("DDR Buffer", ControlID.CONTROL_DDR, "1"),
         ]
 
         for label_text, ctrl_id, default in param_specs:
-            row = ttk.Frame(paramf)
-            row.pack(fill=tk.X, pady=1)
-            ttk.Label(row, text=label_text, width=16, anchor=tk.W).pack(side=tk.LEFT)
-            var = tk.StringVar(value=str(default))
-            entry = ttk.Entry(row, textvariable=var, width=12)
-            entry.pack(side=tk.LEFT, padx=(4, 2))
-            ttk.Button(row, text="Set", width=4,
-                       command=lambda cid=ctrl_id, v=var: self._set_param(cid, v)).pack(side=tk.LEFT, padx=1)
-            ttk.Button(row, text="Get", width=4,
-                       command=lambda cid=ctrl_id, v=var: self._get_param(cid, v)).pack(side=tk.LEFT, padx=1)
-            self._params[ctrl_id] = (entry, var)
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 1, 0, 1)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(130)
+            rl.addWidget(lbl)
+            entry = QLineEdit(default)
+            entry.setFixedWidth(90)
+            rl.addWidget(entry)
+            b1 = QPushButton("Set")
+            b1.setFixedWidth(40)
+            b1.clicked.connect(lambda checked, cid=ctrl_id, e=entry: self._set_param(cid, e))
+            rl.addWidget(b1)
+            b2 = QPushButton("Get")
+            b2.setFixedWidth(40)
+            b2.clicked.connect(lambda checked, cid=ctrl_id, e=entry: self._get_param(cid, e))
+            rl.addWidget(b2)
+            rl.addStretch()
+            gl.addWidget(row)
+            self._params[ctrl_id] = entry
 
         # --- Temperature ---
-        trow = ttk.Frame(paramf)
-        trow.pack(fill=tk.X, pady=1)
-        ttk.Label(trow, text="Target Temp (C)", width=16, anchor=tk.W).pack(side=tk.LEFT)
-        self._temp_var = tk.StringVar(value="0")
-        ttk.Entry(trow, textvariable=self._temp_var, width=12).pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Button(trow, text="Set", width=4, command=self._set_temp).pack(side=tk.LEFT, padx=1)
-        ttk.Button(trow, text="Get", width=4, command=self._get_temp).pack(side=tk.LEFT, padx=1)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 1, 0, 1)
+        rl.addWidget(QLabel("Target Temp (C)"))
+        self._temp_entry = QLineEdit("0")
+        self._temp_entry.setFixedWidth(90)
+        rl.addWidget(self._temp_entry)
+        b1 = QPushButton("Set")
+        b1.setFixedWidth(40)
+        b1.clicked.connect(self._set_temp)
+        rl.addWidget(b1)
+        b2 = QPushButton("Get")
+        b2.setFixedWidth(40)
+        b2.clicked.connect(self._get_temp)
+        rl.addWidget(b2)
+        rl.addStretch()
+        gl.addWidget(row)
+        sl.addWidget(grp)
 
         # --- ROI ---
-        resf = ttk.LabelFrame(frame, text="Resolution / ROI", padding=6)
-        resf.pack(fill=tk.X, pady=4)
+        grp = QGroupBox("Resolution / ROI")
+        gl = QVBoxLayout(grp)
 
-        r1 = ttk.Frame(resf)
-        r1.pack(fill=tk.X, pady=1)
-        ttk.Label(r1, text="X", width=4).pack(side=tk.LEFT)
-        self._res_x_var = tk.StringVar(value="0")
-        ttk.Entry(r1, textvariable=self._res_x_var, width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Label(r1, text="Y", width=4).pack(side=tk.LEFT, padx=(6, 0))
-        self._res_y_var = tk.StringVar(value="0")
-        ttk.Entry(r1, textvariable=self._res_y_var, width=6).pack(side=tk.LEFT, padx=2)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("X"))
+        self._res_x_entry = QLineEdit("0")
+        self._res_x_entry.setFixedWidth(60)
+        rl.addWidget(self._res_x_entry)
+        rl.addSpacing(6)
+        rl.addWidget(QLabel("Y"))
+        self._res_y_entry = QLineEdit("0")
+        self._res_y_entry.setFixedWidth(60)
+        rl.addWidget(self._res_y_entry)
+        rl.addStretch()
+        gl.addWidget(row)
 
-        r2 = ttk.Frame(resf)
-        r2.pack(fill=tk.X, pady=1)
-        ttk.Label(r2, text="W", width=4).pack(side=tk.LEFT)
-        self._res_w_var = tk.StringVar(value="0")
-        ttk.Entry(r2, textvariable=self._res_w_var, width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Label(r2, text="H", width=4).pack(side=tk.LEFT, padx=(6, 0))
-        self._res_h_var = tk.StringVar(value="0")
-        ttk.Entry(r2, textvariable=self._res_h_var, width=6).pack(side=tk.LEFT, padx=2)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("W"))
+        self._res_w_entry = QLineEdit("0")
+        self._res_w_entry.setFixedWidth(60)
+        rl.addWidget(self._res_w_entry)
+        rl.addSpacing(6)
+        rl.addWidget(QLabel("H"))
+        self._res_h_entry = QLineEdit("0")
+        self._res_h_entry.setFixedWidth(60)
+        rl.addWidget(self._res_h_entry)
+        rl.addStretch()
+        gl.addWidget(row)
 
-        ttk.Button(resf, text="Set Resolution", command=self._set_resolution).pack(pady=(4, 0))
-        ttk.Button(resf, text="Fill Effective Area", command=self._fill_effective_area).pack(pady=(2, 0))
+        gl.addWidget(QPushButton("Set Resolution", clicked=self._set_resolution))
+        gl.addWidget(QPushButton("Fill Effective Area", clicked=self._fill_effective_area))
+        sl.addWidget(grp)
 
         # --- Bin / Bits ---
-        binf = ttk.LabelFrame(frame, text="Binning / Bits", padding=6)
-        binf.pack(fill=tk.X, pady=4)
+        grp = QGroupBox("Binning / Bits")
+        gl = QVBoxLayout(grp)
 
-        brf = ttk.Frame(binf)
-        brf.pack(fill=tk.X, pady=1)
-        ttk.Label(brf, text="Bin X").pack(side=tk.LEFT, padx=(0, 2))
-        self._binx_var = tk.StringVar(value="1")
-        ttk.Entry(brf, textvariable=self._binx_var, width=6).pack(side=tk.LEFT)
-        ttk.Label(brf, text="Bin Y").pack(side=tk.LEFT, padx=(6, 2))
-        self._biny_var = tk.StringVar(value="1")
-        ttk.Entry(brf, textvariable=self._biny_var, width=6).pack(side=tk.LEFT)
-        ttk.Button(brf, text="Set Bin", command=self._set_binning).pack(side=tk.LEFT, padx=(4, 0))
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("Bin X"))
+        self._binx_entry = QLineEdit("1")
+        self._binx_entry.setFixedWidth(60)
+        rl.addWidget(self._binx_entry)
+        rl.addWidget(QLabel("Bin Y"))
+        self._biny_entry = QLineEdit("1")
+        self._biny_entry.setFixedWidth(60)
+        rl.addWidget(self._biny_entry)
+        rl.addWidget(QPushButton("Set Bin", clicked=self._set_binning))
+        rl.addStretch()
+        gl.addWidget(row)
 
-        btf = ttk.Frame(binf)
-        btf.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(btf, text="Bits").pack(side=tk.LEFT, padx=(0, 2))
-        self._bits_combo = ttk.Combobox(btf, values=["8", "16"], state="readonly", width=8)
-        self._bits_combo.set("8")
-        self._bits_combo.pack(side=tk.LEFT)
-        ttk.Button(btf, text="Set Bits", command=self._set_bits).pack(side=tk.LEFT, padx=(4, 0))
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 4, 0, 0)
+        rl.addWidget(QLabel("Bits"))
+        self._bits_combo = QComboBox()
+        self._bits_combo.addItems(["8", "16"])
+        self._bits_combo.setFixedWidth(80)
+        rl.addWidget(self._bits_combo)
+        rl.addWidget(QPushButton("Set Bits", clicked=self._set_bits))
+        rl.addStretch()
+        gl.addWidget(row)
+        sl.addWidget(grp)
 
         # --- Capture ---
-        capf = ttk.LabelFrame(frame, text="Capture", padding=6)
-        capf.pack(fill=tk.X, pady=4)
+        grp = QGroupBox("Capture")
+        gl = QVBoxLayout(grp)
 
-        bcap = ttk.Frame(capf)
-        bcap.pack(fill=tk.X)
-        self._btn_single = ttk.Button(bcap, text="Single Frame", command=self._capture_single, state=tk.DISABLED)
-        self._btn_single.pack(side=tk.LEFT, padx=(0, 4))
-        self._btn_live = ttk.Button(bcap, text="Start Live", command=self._toggle_live, state=tk.DISABLED)
-        self._btn_live.pack(side=tk.LEFT)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        self._btn_single = QPushButton("Single Frame", clicked=self._capture_single)
+        self._btn_single.setEnabled(False)
+        rl.addWidget(self._btn_single)
+        self._btn_live = QPushButton("Start Live", clicked=self._toggle_live)
+        self._btn_live.setEnabled(False)
+        rl.addWidget(self._btn_live)
+        rl.addStretch()
+        gl.addWidget(row)
 
-        bsave = ttk.Frame(capf)
-        bsave.pack(fill=tk.X, pady=(4, 0))
-        self._btn_save = ttk.Button(bsave, text="Save Image", command=self._save_image, state=tk.DISABLED)
-        self._btn_save.pack(side=tk.LEFT)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 4, 0, 0)
+        self._btn_save = QPushButton("Save Image", clicked=self._save_image)
+        self._btn_save.setEnabled(False)
+        rl.addWidget(self._btn_save)
+        rl.addStretch()
+        gl.addWidget(row)
 
-        self._capture_info_var = tk.StringVar(value="")
-        ttk.Label(capf, textvariable=self._capture_info_var, foreground="#555").pack(anchor=tk.W, pady=(4, 0))
+        self._capture_info_label = QLabel("")
+        self._capture_info_label.setStyleSheet("color: #555;")
+        gl.addWidget(self._capture_info_label)
+        sl.addWidget(grp)
+
+        sl.addStretch()
 
     def _build_right_panel(self, parent):
-        viewf = ttk.LabelFrame(parent, text="Image View", padding=4)
-        viewf.pack(fill=tk.BOTH, expand=True)
-        self._image_canvas = tk.Canvas(viewf, bg="#1a1a1a", highlightthickness=0)
-        self._image_canvas.pack(fill=tk.BOTH, expand=True)
-        self._image_canvas.bind("<Configure>", self._on_canvas_resize)
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        logf = ttk.LabelFrame(parent, text="Log", padding=4)
-        logf.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(logf, text="Clear", command=self._clear_log).pack(side=tk.RIGHT)
-        self._log_text = tk.Text(logf, height=8, state=tk.DISABLED, wrap=tk.WORD,
-                                  font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
-        self._log_text.pack(fill=tk.X, expand=True)
+        rs = QSplitter(Qt.Vertical)
+        layout.addWidget(rs)
+
+        # Image View
+        vf = QGroupBox("Image View")
+        vl = QVBoxLayout(vf)
+        vl.setContentsMargins(4, 4, 4, 4)
+        self._image_label = ImageLabel()
+        vl.addWidget(self._image_label)
+        rs.addWidget(vf)
+
+        # Log
+        lf = QGroupBox("Log")
+        ll = QVBoxLayout(lf)
+        ll.setContentsMargins(4, 4, 4, 4)
+        lh = QHBoxLayout()
+        lh.addStretch()
+        lh.addWidget(QPushButton("Clear", clicked=self._clear_log))
+        ll.addLayout(lh)
+        self._log_text = QPlainTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setMaximumBlockCount(5000)
+        self._log_text.setStyleSheet(
+            "font-family: Consolas; font-size: 9pt; background-color: #1e1e1e; color: #d4d4d4;"
+        )
+        ll.addWidget(self._log_text)
+        rs.addWidget(lf)
 
     # ==============================================================
     # Logging
     # ==============================================================
     def _log(self, msg):
-        self._log_text.configure(state=tk.NORMAL)
-        self._log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        self._log_text.see(tk.END)
-        self._log_text.configure(state=tk.DISABLED)
+        self._log_text.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     def _clear_log(self):
-        self._log_text.configure(state=tk.NORMAL)
-        self._log_text.delete("1.0", tk.END)
-        self._log_text.configure(state=tk.DISABLED)
+        self._log_text.clear()
 
     # ==============================================================
     # SDK Management
     # ==============================================================
     def _refresh_sdk_status(self):
         pinfo = platform_info()
-        self._platform_var.set(f"Platform: {pinfo['system']}  |  Library: {pinfo['lib_name']}")
-        self._sdk_status_var.set("SDK: Ready")
+        self._platform_label.setText(
+            f"Platform: {pinfo['system']}  |  Library: {pinfo['lib_name']}"
+        )
+        self._sdk_status_label.setText("SDK: Ready")
         ver = self.sdk.get_sdk_version_string()
-        self._sdk_ver_var.set(f"SDK Version: {ver}")
+        self._sdk_ver_label.setText(f"SDK Version: {ver}")
 
     def _check_sdk(self):
         if not self.sdk.lib:
@@ -254,21 +379,12 @@ class QHYCamApp:
         return True
 
     def _auto_init(self):
-        """Auto init on startup: scan, open first camera, set readmode/bits.
-
-        Sequence matching cmake demos:
-          InitQHYCCDResource -> EnableQHYCCDMessage -> Scan ->
-          Open -> SetReadMode -> SetStreamMode(LIVE_MODE) ->
-          InitQHYCCD -> SetBitsMode -> ChipInfo -> SetResolution ->
-          GetMemLength -> SetExposure -> ready
-        """
         if not self._check_sdk():
             self._log("SDK not available, connect a QHYCCD camera.")
             return
 
         self._log("=== Auto Init ===")
 
-        # 1. Init SDK resource
         ret = self.sdk.init_resource()
         if ret != QHYCCDError.QHYCCD_SUCCESS:
             self._log(f"ERROR: InitQHYCCDResource: {error_string(ret)}")
@@ -276,7 +392,6 @@ class QHYCamApp:
         self._log("InitQHYCCDResource: OK")
         self.sdk.enable_message(True)
 
-        # 2. Scan
         count = self.sdk.scan()
         self._log(f"ScanQHYCCD: {count} camera(s)")
         if count == 0:
@@ -285,14 +400,13 @@ class QHYCamApp:
             return
 
         self._camera_list.clear()
-        self._cam_listbox.delete(0, tk.END)
+        self._cam_listwidget.clear()
         for i in range(count):
             cid = self.sdk.get_camera_id(i)
             model = self.sdk.get_camera_model(cid) if cid else "Unknown"
-            self._cam_listbox.insert(tk.END, f"[{i}] {model} ({cid})")
+            self._cam_listwidget.addItem(f"[{i}] {model} ({cid})")
             self._camera_list.append(cid)
 
-        # 3. Open first camera
         cid = self._camera_list[0]
         self._log(f"OpenQHYCCD({cid})...")
         handle = self.sdk.open(cid)
@@ -303,7 +417,7 @@ class QHYCamApp:
 
         model = self.sdk.get_camera_model(cid)
         fw = self.sdk.get_fw_version()
-        self._cam_model_var.set(f"Model: {model}  FW: {fw}")
+        self._cam_model_label.setText(f"Model: {model}  FW: {fw}")
         self._log(f"Camera opened: {model}, FW: {fw}")
 
         bayer = self.sdk.get_color_bayer()
@@ -313,9 +427,8 @@ class QHYCamApp:
             extra.append("Cooler")
         if self.sdk.has_gps():
             extra.append("GPS")
-        self._cam_color_var.set(f"{color_str}  {' | '.join(extra)}")
+        self._cam_color_label.setText(f"{color_str}  {' | '.join(extra)}")
 
-        # 4. SetReadMode(1) -> SetStreamMode(LIVE_MODE) -> InitQHYCCD
         self.sdk.set_read_mode(self._current_read_mode)
         self._log(f"SetQHYCCDReadMode({self._current_read_mode})")
         self.sdk.set_stream_mode(LIVE_MODE)
@@ -327,23 +440,24 @@ class QHYCamApp:
             return
         self._log("InitQHYCCD: OK")
 
-        # 5. SetBitsMode after InitQHYCCD (per demo)
-        self.sdk.set_bits_mode(int(self._bits_combo.get()))
-        self._log(f"SetQHYCCDBitsMode({self._bits_combo.get()})")
+        self.sdk.set_bits_mode(int(self._bits_combo.currentText()))
+        self._log(f"SetQHYCCDBitsMode({self._bits_combo.currentText()})")
 
-        # 6. Chip info + Resolution + MemLength (per demo order)
         chip = self.sdk.get_chip_info()
         if chip:
             cw, ch, iw, ih, pw, ph, bpp = chip
-            self._log(f"Chip: {cw:.1f}x{ch:.1f}mm, Max: {iw}x{ih}, Pixel: {pw:.1f}x{ph:.1f}um, {bpp}bit")
+            self._log(
+                f"Chip: {cw:.1f}x{ch:.1f}mm, Max: {iw}x{ih}, "
+                f"Pixel: {pw:.1f}x{ph:.1f}um, {bpp}bit"
+            )
 
         area = self.sdk.get_effective_area()
         if area and area[2] > 0:
             self._full_w, self._full_h = area[2], area[3]
-            self._res_x_var.set(str(area[0]))
-            self._res_y_var.set(str(area[1]))
-            self._res_w_var.set(str(area[2]))
-            self._res_h_var.set(str(area[3]))
+            self._res_x_entry.setText(str(area[0]))
+            self._res_y_entry.setText(str(area[1]))
+            self._res_w_entry.setText(str(area[2]))
+            self._res_h_entry.setText(str(area[3]))
             self.sdk.set_resolution(area[0], area[1], area[2], area[3])
             self._log(f"SetQHYCCDResolution: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
         else:
@@ -352,17 +466,15 @@ class QHYCamApp:
         self._mem_len = self.sdk.get_mem_length()
         self._log(f"GetQHYCCDMemLength: {self._mem_len} bytes")
 
-        # 7. Default exposure
         self.sdk.set_param(ControlID.CONTROL_EXPOSURE, 100000.0)
 
-        # Enable GPS on cameras that support it (CAM_GPS)
         if self.sdk.has_gps():
             self.sdk.set_param(ControlID.CAM_GPS, 1.0)
             self._log("GPS: Enabled")
 
-        self._btn_single.configure(state=tk.NORMAL)
-        self._btn_live.configure(state=tk.NORMAL)
-        self._btn_close.configure(state=tk.NORMAL)
+        self._btn_single.setEnabled(True)
+        self._btn_live.setEnabled(True)
+        self._btn_close.setEnabled(True)
         self._enable_params(True)
         self._log("=== Ready ===")
 
@@ -374,28 +486,27 @@ class QHYCamApp:
             self.sdk.close()
             self._log("Camera closed.")
 
-        self._cam_model_var.set("Model: --")
-        self._cam_color_var.set("")
-        self._gps_var.set("GPS: --")
-        self._btn_close.configure(state=tk.DISABLED)
-        self._btn_single.configure(state=tk.DISABLED)
-        self._btn_live.configure(state=tk.DISABLED)
-        self._btn_save.configure(state=tk.DISABLED)
+        self._cam_model_label.setText("Model: --")
+        self._cam_color_label.setText("")
+        self._gps_label.setText("GPS: --")
+        self._btn_close.setEnabled(False)
+        self._btn_single.setEnabled(False)
+        self._btn_live.setEnabled(False)
+        self._btn_save.setEnabled(False)
         self._enable_params(False)
 
     def _enable_params(self, enabled):
-        state = tk.NORMAL if enabled else tk.DISABLED
-        for _cid, (entry, _var) in self._params.items():
-            entry.configure(state=state)
+        for entry in self._params.values():
+            entry.setEnabled(enabled)
 
     # ==============================================================
     # Parameters
     # ==============================================================
-    def _set_param(self, control_id, var):
+    def _set_param(self, control_id, entry):
         if not self._check_sdk() or not self.sdk.handle:
             return
         try:
-            val = float(var.get())
+            val = float(entry.text())
         except ValueError:
             self._log("ERROR: Invalid numeric value.")
             return
@@ -406,13 +517,13 @@ class QHYCamApp:
         else:
             self._log(f"ERROR set {ctrl_name}: {error_string(ret)}")
 
-    def _get_param(self, control_id, var):
+    def _get_param(self, control_id, entry):
         if not self._check_sdk() or not self.sdk.handle:
             return
         val = self.sdk.get_param(control_id)
         ctrl_name = ControlID(control_id).name
         if val is not None:
-            var.set(str(int(val)) if val == int(val) else f"{val:.2f}")
+            entry.setText(str(int(val)) if val == int(val) else f"{val:.2f}")
             self._log(f"Get {ctrl_name} = {val}")
         else:
             self._log(f"ERROR get {ctrl_name}: no value")
@@ -421,7 +532,7 @@ class QHYCamApp:
         if not self._check_sdk() or not self.sdk.handle:
             return
         try:
-            val = float(self._temp_var.get())
+            val = float(self._temp_entry.text())
         except ValueError:
             self._log("ERROR: Invalid temperature value.")
             return
@@ -437,7 +548,7 @@ class QHYCamApp:
         t = self.sdk.get_temp()
         p = self.sdk.get_cooler_pwm()
         if t is not None:
-            self._temp_var.set(f"{t:.1f}")
+            self._temp_entry.setText(f"{t:.1f}")
             self._log(f"Current temp: {t:.1f} C, PWM: {p}")
 
     # ==============================================================
@@ -447,10 +558,10 @@ class QHYCamApp:
         if not self._check_sdk() or not self.sdk.handle:
             return
         try:
-            x = int(self._res_x_var.get() or 0)
-            y = int(self._res_y_var.get() or 0)
-            w = int(self._res_w_var.get() or 0)
-            h = int(self._res_h_var.get() or 0)
+            x = int(self._res_x_entry.text() or 0)
+            y = int(self._res_y_entry.text() or 0)
+            w = int(self._res_w_entry.text() or 0)
+            h = int(self._res_h_entry.text() or 0)
         except ValueError:
             self._log("ERROR: Invalid resolution values.")
             return
@@ -465,10 +576,10 @@ class QHYCamApp:
             return
         area = self.sdk.get_effective_area()
         if area:
-            self._res_x_var.set(str(area[0]))
-            self._res_y_var.set(str(area[1]))
-            self._res_w_var.set(str(area[2]))
-            self._res_h_var.set(str(area[3]))
+            self._res_x_entry.setText(str(area[0]))
+            self._res_y_entry.setText(str(area[1]))
+            self._res_w_entry.setText(str(area[2]))
+            self._res_h_entry.setText(str(area[3]))
             self._log(f"Effective area: ({area[0]},{area[1]}) {area[2]}x{area[3]}")
 
     # ==============================================================
@@ -478,8 +589,8 @@ class QHYCamApp:
         if not self._check_sdk() or not self.sdk.handle:
             return
         try:
-            bx = int(self._binx_var.get())
-            by = int(self._biny_var.get())
+            bx = int(self._binx_entry.text())
+            by = int(self._biny_entry.text())
         except ValueError:
             self._log("ERROR: Invalid bin values.")
             return
@@ -492,7 +603,7 @@ class QHYCamApp:
     def _set_bits(self):
         if not self._check_sdk() or not self.sdk.handle:
             return
-        bits = int(self._bits_combo.get())
+        bits = int(self._bits_combo.currentText())
         ret = self.sdk.set_bits_mode(bits)
         if ret == QHYCCDError.QHYCCD_SUCCESS:
             self._log(f"Bits mode set: {bits}bit")
@@ -508,7 +619,6 @@ class QHYCamApp:
 
         self._log("Single frame: switching to SINGLE_MODE...")
 
-        # Re-init with SINGLE_MODE for single frame (stream mode locked at init)
         self.sdk.set_stream_mode(SINGLE_MODE)
         ret = self.sdk.init()
         if ret != QHYCCDError.QHYCCD_SUCCESS:
@@ -521,7 +631,7 @@ class QHYCamApp:
             self._read_single_frame(after_switch_back=True)
         elif ret == QHYCCDError.QHYCCD_SUCCESS:
             self._log("Exposure started, waiting...")
-            self.root.after(100, lambda: self._read_single_frame(after_switch_back=True))
+            QTimer.singleShot(100, lambda: self._read_single_frame(after_switch_back=True))
         else:
             self._log(f"ERROR exposure: {error_string(ret)}")
             self._restore_live_mode()
@@ -530,12 +640,12 @@ class QHYCamApp:
         result = self.sdk.get_single_frame()
         if result is None:
             self._log("Waiting for frame...")
-            self.root.after(300, lambda: self._read_single_frame(after_switch_back))
+            QTimer.singleShot(300, lambda: self._read_single_frame(after_switch_back))
             return
         w, h, bpp, ch, imgdata = result
         self._log(f"Frame: {w}x{h}, {bpp}bit, {ch}ch, {len(imgdata)} bytes")
         self._display_image(w, h, bpp, ch, imgdata)
-        self._btn_save.configure(state=tk.NORMAL)
+        self._btn_save.setEnabled(True)
 
         if after_switch_back:
             self._restore_live_mode()
@@ -565,9 +675,9 @@ class QHYCamApp:
             self._log(f"ERROR begin live: {error_string(ret)}")
             return
         self._live_running = True
-        self._btn_live.configure(text="Stop Live")
-        self._btn_single.configure(state=tk.DISABLED)
-        self._btn_save.configure(state=tk.NORMAL)
+        self._btn_live.setText("Stop Live")
+        self._btn_single.setEnabled(False)
+        self._btn_save.setEnabled(True)
         self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
         self._live_thread.start()
 
@@ -578,7 +688,7 @@ class QHYCamApp:
                 time.sleep(0.05)
                 continue
             w, h, bpp, ch, imgdata = result
-            self.root.after(0, self._update_live_display, w, h, bpp, ch, imgdata)
+            self.live_frame_signal.emit(w, h, bpp, ch, imgdata)
             time.sleep(0.03)
 
     def _stop_live(self):
@@ -588,11 +698,13 @@ class QHYCamApp:
             self._live_thread.join(timeout=2)
             self._live_thread = None
         self.sdk.stop_live()
-        self._btn_live.configure(text="Start Live")
-        self._btn_single.configure(state=tk.NORMAL)
+        self._btn_live.setText("Start Live")
+        self._btn_single.setEnabled(True)
         self._log("Live video stopped.")
 
-    def _update_live_display(self, w, h, bpp, ch, imgdata):
+    def _on_live_frame(self, w, h, bpp, ch, imgdata):
+        if not self._live_running:
+            return
         self._display_image(w, h, bpp, ch, imgdata)
 
     # ==============================================================
@@ -601,13 +713,13 @@ class QHYCamApp:
     def _parse_frame_gps(self, imgdata, w, bpp, ch):
         gps = parse_gps_from_frame(imgdata, w, bpp, ch)
         if gps and gps.get("locked"):
-            self._gps_var.set(
+            self._gps_label.setText(
                 f"GPS: {gps['year']}-{gps['month']:02d}-{gps['day']:02d} "
                 f"{gps['hour']:02d}:{gps['minute']:02d}:{gps['second']:02d} UTC  "
                 f"Seq: {gps['seq']}"
             )
         elif gps:
-            self._gps_var.set(f"GPS: Unlocked (seq={gps['seq']})")
+            self._gps_label.setText(f"GPS: Unlocked (seq={gps['seq']})")
 
     def _display_image(self, w, h, bpp, ch, imgdata):
         self._parse_frame_gps(imgdata, w, bpp, ch)
@@ -623,34 +735,34 @@ class QHYCamApp:
 
             img = Image.fromarray(arr)
             self._captured_image = img
-            self._show_on_canvas(img)
+
+            w_img, h_img = img.size
+            raw_bytes = img.tobytes("raw", img.mode)
+            if img.mode == "L":
+                fmt = QImage.Format_Grayscale8
+                bpl = w_img
+            elif img.mode == "RGB":
+                fmt = QImage.Format_RGB888
+                bpl = w_img * 3
+            else:
+                img_rgb = img.convert("RGB")
+                raw_bytes = img_rgb.tobytes("raw", "RGB")
+                fmt = QImage.Format_RGB888
+                bpl = img_rgb.width
+
+            qimg = QImage(raw_bytes, w_img, h_img, bpl, fmt)
+            pixmap = QPixmap.fromImage(qimg)
+            self._image_label.set_display_pixmap(pixmap)
+            self._capture_info_label.setText(f"Image: {w}x{h}")
         except Exception as e:
             self._log(f"ERROR rendering image: {e}")
-
-    def _show_on_canvas(self, pil_img):
-        cw = self._image_canvas.winfo_width()
-        ch = self._image_canvas.winfo_height()
-        if cw < 10 or ch < 10:
-            return
-        iw, ih = pil_img.size
-        scale = min(cw / iw, ch / ih, 1.0)
-        nw, nh = int(iw * scale), int(ih * scale)
-        resized = pil_img.resize((nw, nh), Image.NEAREST)
-        self._photo = ImageTk.PhotoImage(resized)
-        self._image_canvas.delete("all")
-        self._image_canvas.create_image(cw // 2, ch // 2, image=self._photo, anchor=tk.CENTER)
-        self._capture_info_var.set(f"Image: {iw}x{ih}  (scaled {nw}x{nh})")
-
-    def _on_canvas_resize(self, event):
-        if self._captured_image:
-            self._show_on_canvas(self._captured_image)
 
     def _save_image(self):
         if self._captured_image is None:
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG Image", "*.png"), ("FITS", "*.fits"), ("TIFF", "*.tiff"), ("All", "*.*")]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Image",
+            filter="PNG Image (*.png);;FITS (*.fits);;TIFF (*.tiff);;All (*.*)",
         )
         if path:
             self._captured_image.save(path)
@@ -659,20 +771,20 @@ class QHYCamApp:
     # ==============================================================
     # Cleanup
     # ==============================================================
-    def on_close(self):
+    def closeEvent(self, event):
         if self._live_running:
             self._stop_live()
         if self.sdk.handle:
             self.sdk.close()
         self.sdk.release_resource()
-        self.root.destroy()
+        event.accept()
 
 
 def main():
-    root = tk.Tk()
-    app = QHYCamApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = QHYCamWindow()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
